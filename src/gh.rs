@@ -21,10 +21,11 @@ pub struct PrView {
 }
 
 fn spawn(args: &[&str]) -> Result<(i32, String, String)> {
-    let out = Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|e| GtError::Gh(format!("failed to run `gh` (is the GitHub CLI installed?): {e}")))?;
+    let out = Command::new("gh").args(args).output().map_err(|e| {
+        GtError::Gh(format!(
+            "failed to run `gh` (is the GitHub CLI installed?): {e}"
+        ))
+    })?;
     Ok((
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -44,14 +45,22 @@ fn checked(args: &[&str], ctx: &str) -> Result<()> {
 
 /// Look up the pull request whose head is `branch`, if one exists.
 pub fn view(branch: &str) -> Result<Option<PrView>> {
-    let (code, stdout, stderr) =
-        spawn(&["pr", "view", branch, "--json", "number,url,baseRefName,state,title"])?;
+    let (code, stdout, stderr) = spawn(&[
+        "pr",
+        "view",
+        "--json",
+        "number,url,baseRefName,state,title",
+        "--",
+        branch,
+    ])?;
     if code != 0 {
         let s = stderr.to_lowercase();
         if s.contains("no pull requests found") || s.contains("no open pull requests") {
             return Ok(None);
         }
-        return Err(GtError::Gh(format!("`gh pr view {branch}` failed: {stderr}")));
+        return Err(GtError::Gh(format!(
+            "`gh pr view {branch}` failed: {stderr}"
+        )));
     }
     Ok(Some(serde_json::from_str(&stdout)?))
 }
@@ -59,12 +68,17 @@ pub fn view(branch: &str) -> Result<Option<PrView>> {
 /// Create a pull request for `head` against `base`.
 pub fn create(head: &str, base: &str, title: &str, body: &str) -> Result<()> {
     checked(
-        &["pr", "create", "--head", head, "--base", base, "--title", title, "--body", body],
+        &[
+            "pr", "create", "--head", head, "--base", base, "--title", title, "--body", body,
+        ],
         &format!("pr create for `{head}`"),
     )
 }
 
 /// Re-target an existing pull request onto a new base branch.
 pub fn set_base(number: u64, base: &str) -> Result<()> {
-    checked(&["pr", "edit", &number.to_string(), "--base", base], "pr edit")
+    checked(
+        &["pr", "edit", &number.to_string(), "--base", base],
+        "pr edit",
+    )
 }

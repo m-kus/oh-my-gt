@@ -104,7 +104,10 @@ pub fn delete(branch: &str) -> Result<()> {
     let r = meta_ref(branch);
     let out = git::run_allow_fail(&["update-ref", "-d", &r])?;
     if out.code != 0 && git::ref_exists(&r)? {
-        return Err(GtError::Git(format!("failed to delete {r}: {}", out.stderr)));
+        return Err(GtError::Git(format!(
+            "failed to delete {r}: {}",
+            out.stderr
+        )));
     }
     Ok(())
 }

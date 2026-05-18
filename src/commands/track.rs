@@ -16,7 +16,8 @@ pub fn run() -> Result<()> {
     if let Some(node) = graph.get(&current) {
         if node.validation == Validation::Valid {
             let parent = node.parent.clone().unwrap();
-            let q = format!("`{current}` is already tracked (parent `{parent}`); re-pick its parent?");
+            let q =
+                format!("`{current}` is already tracked (parent `{parent}`); re-pick its parent?");
             if !prompt::confirm(&q, false)? {
                 return Ok(());
             }
@@ -26,7 +27,10 @@ pub fn run() -> Result<()> {
     let parent = choose_parent(&graph, &current)?;
     let base = git::merge_base(&parent, &current)?;
 
-    let mut m = graph.get(&current).and_then(|n| n.meta.clone()).unwrap_or_default();
+    let mut m = graph
+        .get(&current)
+        .and_then(|n| n.meta.clone())
+        .unwrap_or_default();
     m.parent_branch_name = Some(parent.clone());
     m.parent_branch_revision = Some(base);
     meta::write(&current, &m)?;
@@ -71,6 +75,10 @@ fn choose_parent(graph: &StackGraph, current: &str) -> Result<String> {
         }
     }
 
-    let idx = prompt::select(&format!("parent branch for `{current}`:"), &candidates, best)?;
+    let idx = prompt::select(
+        &format!("parent branch for `{current}`:"),
+        &candidates,
+        best,
+    )?;
     Ok(candidates.swap_remove(idx))
 }

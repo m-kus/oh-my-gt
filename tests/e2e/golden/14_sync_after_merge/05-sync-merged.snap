@@ -1,0 +1,20 @@
+# step: sync-merged (exit=0)
+HEAD: gamma
+rebase: none
+status:
+branches:
+  beta -> @beta-feature-1ed256 tree=1ed256a3af6f121d4e17ffbfd62de252d027efb6
+  gamma -> @gamma-feature-59afbf tree=59afbf88d6a407d706caa659096d21faa4c0d429
+  main -> @unrelated-hotfix tree=e399eb27ab9cd9f14d66515c6ccdcb0ebe7d125e
+commits:
+@alpha-feature tree=e7a6795824337bf7b6300a422b9b33ba4a97e8a3 parents=[@root-commit] alpha feature
+@beta-feature-6476fd tree=6476fd8b0607b3401632fc9dea1f5282cc0fcdf9 parents=[@alpha-feature] beta feature
+@beta-feature-1ed256 tree=1ed256a3af6f121d4e17ffbfd62de252d027efb6 parents=[@unrelated-hotfix] beta feature
+@gamma-feature-59afbf tree=59afbf88d6a407d706caa659096d21faa4c0d429 parents=[@beta-feature-1ed256] gamma feature
+@gamma-feature-3b3b3e tree=3b3b3ed7990c0dc5bf69d9b048dbaa3d863d56db parents=[@beta-feature-6476fd] gamma feature
+@merge-alpha tree=e7a6795824337bf7b6300a422b9b33ba4a97e8a3 parents=[@root-commit @alpha-feature] merge alpha
+@root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
+@unrelated-hotfix tree=e399eb27ab9cd9f14d66515c6ccdcb0ebe7d125e parents=[@merge-alpha] unrelated hotfix
+metadata:
+  beta: {"parentBranchName":"main","parentBranchRevision":"@unrelated-hotfix","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"beta feature","state":"OPEN"}}
+  gamma: {"parentBranchName":"beta","parentBranchRevision":"@beta-feature-1ed256","prInfo":{"number":3,"base":"beta","url":"https://example.test/pr/3","title":"gamma feature","state":"OPEN"}}

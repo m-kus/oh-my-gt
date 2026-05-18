@@ -42,7 +42,11 @@ pub fn run() -> Result<()> {
 fn print_node(graph: &StackGraph, name: &str, depth: usize) {
     let node = &graph.nodes[name];
     let indent = "  ".repeat(depth);
-    let here = if graph.current.as_deref() == Some(name) { " *" } else { "" };
+    let here = if graph.current.as_deref() == Some(name) {
+        " *"
+    } else {
+        ""
+    };
     let short = &node.tip[..node.tip.len().min(8)];
     let flag = if name != graph.trunk && graph.needs_restack(name) {
         "  (needs restack)"

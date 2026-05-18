@@ -8,7 +8,9 @@ use crate::{gh, git, meta};
 pub fn run() -> Result<()> {
     let (graph, current) = StackGraph::load_current()?;
     if graph.is_trunk(&current) {
-        return Err(GtError::Usage("the trunk has no pull request to submit".into()));
+        return Err(GtError::Usage(
+            "the trunk has no pull request to submit".into(),
+        ));
     }
 
     // The downstack path trunk..current; submit everything but the trunk.
@@ -40,7 +42,8 @@ pub fn run() -> Result<()> {
         };
 
         // Restacks rewrite history, so force-with-lease rather than plain push.
-        git::run(&["push", "--force-with-lease", "origin", branch])?;
+        let refspec = git::head_refspec(branch);
+        git::run(&["push", "--force-with-lease", "origin", &refspec])?;
 
         let mut m = meta::read(branch)?.unwrap_or_default();
         let existing = m.pr_info.as_ref().and_then(|p| p.number);
@@ -62,8 +65,9 @@ pub fn run() -> Result<()> {
                     gh::view(branch)?.unwrap_or(v)
                 }
                 None => {
-                    let title = git::run(&["show", "-s", "--format=%s", branch])?;
-                    let body = git::run(&["show", "-s", "--format=%b", branch])?;
+                    let branch_ref = git::head_ref(branch);
+                    let title = git::run(&["show", "-s", "--format=%s", &branch_ref])?;
+                    let body = git::run(&["show", "-s", "--format=%b", &branch_ref])?;
                     gh::create(branch, &base, &title, &body)?;
                     gh::view(branch)?.ok_or_else(|| {
                         GtError::Gh(format!("PR for `{branch}` could not be read back"))
@@ -82,7 +86,11 @@ pub fn run() -> Result<()> {
         });
         meta::write(branch, &m)?;
 
-        let verb = if existing.is_some() { "updated  " } else { "submitted" };
+        let verb = if existing.is_some() {
+            "updated  "
+        } else {
+            "submitted"
+        };
         println!("{verb}  {branch}  #{}  {}", pr.number, pr.url);
     }
     Ok(())

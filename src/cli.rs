@@ -79,6 +79,8 @@ pub fn run() -> Result<()> {
         "continue" => commands::continue_::run(),
         "abort" => commands::abort::run(),
         "log" => commands::log::run(),
-        other => Err(GtError::Usage(format!("unknown command `{other}`\n\n{USAGE}"))),
+        other => Err(GtError::Usage(format!(
+            "unknown command `{other}`\n\n{USAGE}"
+        ))),
     }
 }

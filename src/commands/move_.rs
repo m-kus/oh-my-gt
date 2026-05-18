@@ -31,7 +31,10 @@ pub fn run() -> Result<()> {
         return Err(GtError::State("no valid branch to move onto".into()));
     }
 
-    let default = candidates.iter().position(|b| *b == graph.trunk).unwrap_or(0);
+    let default = candidates
+        .iter()
+        .position(|b| *b == graph.trunk)
+        .unwrap_or(0);
     let idx = prompt::select(&format!("move `{current}` onto:"), &candidates, default)?;
     let new_parent = candidates.swap_remove(idx);
 
@@ -47,6 +50,13 @@ pub fn run() -> Result<()> {
 
     // Fail before mutating metadata if the restack could not run.
     git::ensure_clean()?;
+    if git::rebase_in_progress(&git::git_dir()?) {
+        return Err(GtError::Precondition(
+            "a git rebase is already in progress".into(),
+        ));
+    }
+    let rollback_branches = graph.subtree(&current);
+    let rollback_snapshot = rebase::snapshot_branches(&graph, &rollback_branches)?;
 
     // Re-parent in metadata; the fork point stays put so the restack replays
     // exactly this branch's own commits onto the new parent.
@@ -55,5 +65,12 @@ pub fn run() -> Result<()> {
     meta::write(&current, &m)?;
 
     println!("re-parented `{current}` from `{old_parent}` onto `{new_parent}`");
-    rebase::restack(std::slice::from_ref(&current), "move")
+    let updated = StackGraph::load()?;
+    let mut plan = rebase::plan(&updated, std::slice::from_ref(&current), "move")?;
+    if plan.chains.is_empty() {
+        println!("the stack is already up to date");
+        return Ok(());
+    }
+    plan.snapshot = rollback_snapshot;
+    rebase::start(&updated, plan)
 }

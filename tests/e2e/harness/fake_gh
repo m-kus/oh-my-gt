@@ -15,7 +15,24 @@ shift 2 2>/dev/null || true
 
 case "$sub" in
   view)
-    branch="${1:-}"
+    branch=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --json|-q|--template|-t)
+          shift 2 ;;
+        -c|--comments)
+          shift ;;
+        --)
+          shift
+          branch="${1:-}"
+          break ;;
+        -*)
+          shift ;;
+        *)
+          branch="$1"
+          shift ;;
+      esac
+    done
     f="$DIR/pr_$branch"
     if [ -f "$f" ]; then
       # shellcheck disable=SC1090

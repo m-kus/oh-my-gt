@@ -37,7 +37,8 @@ pub fn run() -> Result<()> {
     // The new branch forks from the parent's current tip.
     let parent_tip = graph.get(&parent).unwrap().tip.clone();
 
-    git::run(&["switch", "-c", &name])?;
+    git::run(&["branch", "--", &name])?;
+    git::run(&["switch", "--", &name])?;
     git::run(&["commit", "-m", &message])?;
 
     meta::write(&name, &BranchMetadata::new(&parent, &parent_tip))?;

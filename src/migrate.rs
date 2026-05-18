@@ -26,7 +26,9 @@ pub fn check() -> Result<()> {
             "oh-my-gt: found {count} branch(es) with existing Graphite metadata — using them as-is"
         );
     } else if let Some(file) = sqlite_metadata(&git::git_dir()?) {
-        println!("oh-my-gt: detected Graphite's newer metadata ({file}), which cannot be imported;");
+        println!(
+            "oh-my-gt: detected Graphite's newer metadata ({file}), which cannot be imported;"
+        );
         println!("          run `gt track` on each stack to start tracking with oh-my-gt");
     }
     Ok(())
@@ -34,7 +36,11 @@ pub fn check() -> Result<()> {
 
 /// Name of a modern-Graphite metadata file in `.git`, if present.
 fn sqlite_metadata(git_dir: &Path) -> Option<String> {
-    for name in ["graphite.db", ".graphite_repo_config", ".graphite_cache_persist"] {
+    for name in [
+        "graphite.db",
+        ".graphite_repo_config",
+        ".graphite_cache_persist",
+    ] {
         if git_dir.join(name).exists() {
             return Some(name.to_string());
         }

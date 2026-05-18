@@ -8,9 +8,17 @@ pub fn run() -> Result<()> {
     let (graph, current) = StackGraph::load_current()?;
     let node = graph.require_tracked(&current)?;
 
-    let base = node.meta.as_ref().unwrap().parent_branch_revision.clone().unwrap();
+    let base = node
+        .meta
+        .as_ref()
+        .unwrap()
+        .parent_branch_revision
+        .clone()
+        .unwrap();
     if node.tip == base {
-        return Err(GtError::Precondition(format!("`{current}` has no commit to amend")));
+        return Err(GtError::Precondition(format!(
+            "`{current}` has no commit to amend"
+        )));
     }
 
     if !git::status_porcelain()?.is_empty()

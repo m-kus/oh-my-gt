@@ -98,22 +98,40 @@ pub fn plan(graph: &StackGraph, roots: &[String], operation: &str) -> Result<Res
     }
 
     // Snapshot every branch a chain will touch, for `abort`.
-    let mut snap_names: BTreeSet<String> = BTreeSet::new();
+    let mut snap_names: Vec<String> = Vec::new();
     for c in &chains {
         for b in &c.branches {
-            snap_names.insert(b.clone());
+            snap_names.push(b.clone());
         }
     }
+    let snapshot = snapshot_branches(graph, &snap_names)?;
+
+    Ok(RestackPlan {
+        operation: operation.to_string(),
+        chains,
+        snapshot,
+    })
+}
+
+/// Snapshot branch refs and metadata for later rollback.
+pub fn snapshot_branches(graph: &StackGraph, branches: &[String]) -> Result<Vec<BranchSnapshot>> {
+    let mut snap_names: BTreeSet<String> = BTreeSet::new();
+    for b in branches {
+        snap_names.insert(b.clone());
+    }
+
     let mut snapshot = Vec::new();
     for b in snap_names {
+        let Some(node) = graph.get(&b) else {
+            continue;
+        };
         snapshot.push(BranchSnapshot {
-            tip: graph.get(&b).unwrap().tip.clone(),
+            tip: node.tip.clone(),
             metadata_blob: meta::blob_sha(&b)?,
             branch: b,
         });
     }
-
-    Ok(RestackPlan { operation: operation.to_string(), chains, snapshot })
+    Ok(snapshot)
 }
 
 /// Load the graph, plan a restack of `roots`, and execute it.
@@ -129,13 +147,14 @@ pub fn restack(roots: &[String], operation: &str) -> Result<()> {
 
 /// Begin executing a freshly-built plan.
 pub fn start(graph: &StackGraph, plan: RestackPlan) -> Result<()> {
-    let current = graph
-        .current
-        .clone()
-        .ok_or_else(|| GtError::Precondition("HEAD is detached; check out a branch first".into()))?;
+    let current = graph.current.clone().ok_or_else(|| {
+        GtError::Precondition("HEAD is detached; check out a branch first".into())
+    })?;
     git::ensure_clean()?;
     if git::rebase_in_progress(&git::git_dir()?) {
-        return Err(GtError::Precondition("a git rebase is already in progress".into()));
+        return Err(GtError::Precondition(
+            "a git rebase is already in progress".into(),
+        ));
     }
 
     let st = OpState {
@@ -174,8 +193,8 @@ pub fn resume() -> Result<()> {
 
 /// Abort an in-progress operation (`gt abort`), restoring the prior state.
 pub fn abort() -> Result<()> {
-    let st = state::load()?
-        .ok_or_else(|| GtError::Usage("no operation in progress to abort".into()))?;
+    let st =
+        state::load()?.ok_or_else(|| GtError::Usage("no operation in progress to abort".into()))?;
 
     if git::rebase_in_progress(&git::git_dir()?) {
         git::run(&["rebase", "--abort"])?;
@@ -183,7 +202,7 @@ pub fn abort() -> Result<()> {
 
     // Roll every touched branch back to its pre-operation tip and metadata.
     for s in &st.snapshot {
-        git::run(&["update-ref", &format!("refs/heads/{}", s.branch), &s.tip])?;
+        git::run(&["update-ref", &git::head_ref(&s.branch), &s.tip])?;
         match &s.metadata_blob {
             Some(blob) => meta::restore_ref(&s.branch, blob)?,
             None => meta::delete(&s.branch)?,
@@ -197,7 +216,7 @@ pub fn abort() -> Result<()> {
     // used so it can never discard uncommitted work.
     if let Some(rb) = &st.return_branch {
         if git::branch_exists(rb)? {
-            let _ = git::run(&["switch", rb]);
+            let _ = git::run(&["switch", "--", rb]);
         }
     }
     Ok(())
@@ -216,8 +235,15 @@ fn drive(mut st: OpState) -> Result<()> {
         // The parent's tip is final now (its chain ran earlier).
         let new_base = git::branch_tip(&chain.parent)?;
         let code = git::run_interactive(&[
-            "rebase", "--update-refs", "--committer-date-is-author-date", "--empty=drop",
-            "--onto", &new_base, &chain.old_base, chain.tip(),
+            "rebase",
+            "--update-refs",
+            "--committer-date-is-author-date",
+            "--empty=drop",
+            "--onto",
+            &new_base,
+            &chain.old_base,
+            "--",
+            chain.tip(),
         ])?;
         if code != 0 {
             let gd = git::git_dir()?;
@@ -233,7 +259,11 @@ fn finish_chain(st: &mut OpState) -> Result<()> {
     let idx = st.current_chain;
     let chain = st.chains[idx].clone();
     for (i, branch) in chain.branches.iter().enumerate() {
-        let parent = if i == 0 { &chain.parent } else { &chain.branches[i - 1] };
+        let parent = if i == 0 {
+            &chain.parent
+        } else {
+            &chain.branches[i - 1]
+        };
         let parent_tip = git::branch_tip(parent)?;
         let mut m = meta::read(branch)?.unwrap_or_default();
         m.parent_branch_name = Some(parent.clone());

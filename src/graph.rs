@@ -79,7 +79,11 @@ impl StackGraph {
             );
         }
 
-        let mut graph = StackGraph { nodes, trunk, current };
+        let mut graph = StackGraph {
+            nodes,
+            trunk,
+            current,
+        };
         graph.validate(&heads, &live_revs);
         graph.link_children();
         Ok(graph)
@@ -124,6 +128,29 @@ impl StackGraph {
                 }
             };
             self.nodes.get_mut(name).unwrap().validation = verdict;
+        }
+
+        // A metadata cycle is unusable even though every immediate parent name
+        // resolves. Mark each branch that can walk back to itself as invalid.
+        for name in &names {
+            if self.nodes[name].validation != Validation::Valid {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let mut cur = name.clone();
+            while let Some(node) = self.nodes.get(&cur) {
+                if !seen.insert(cur.clone()) {
+                    self.nodes.get_mut(name).unwrap().validation = Validation::InvalidParent;
+                    break;
+                }
+                let Some(parent) = node.parent.clone() else {
+                    break;
+                };
+                if parent == self.trunk {
+                    break;
+                }
+                cur = parent;
+            }
         }
 
         // Propagate: a branch with a non-usable ancestor is `InvalidParent`.
@@ -184,12 +211,17 @@ impl StackGraph {
 
     /// Does this branch's recorded fork point lag behind its parent's tip?
     pub fn needs_restack(&self, name: &str) -> bool {
-        let Some(node) = self.nodes.get(name) else { return false };
+        let Some(node) = self.nodes.get(name) else {
+            return false;
+        };
         if node.validation != Validation::Valid {
             return false;
         }
         let parent = node.parent.as_deref().unwrap();
-        let recorded = node.meta.as_ref().and_then(|m| m.parent_branch_revision.as_deref());
+        let recorded = node
+            .meta
+            .as_ref()
+            .and_then(|m| m.parent_branch_revision.as_deref());
         let parent_tip = self.nodes.get(parent).map(|p| p.tip.as_str());
         match (recorded, parent_tip) {
             (Some(r), Some(t)) => r != t,
@@ -200,8 +232,12 @@ impl StackGraph {
     /// Self + all descendants, parents before children (topological).
     pub fn subtree(&self, root: &str) -> Vec<String> {
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
         let mut queue = VecDeque::from([root.to_string()]);
         while let Some(name) = queue.pop_front() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
             out.push(name.clone());
             if let Some(node) = self.nodes.get(&name) {
                 for c in &node.children {
@@ -222,8 +258,12 @@ impl StackGraph {
     /// Ancestor chain from trunk down to (and including) `name`.
     pub fn path_from_trunk(&self, name: &str) -> Vec<String> {
         let mut chain = Vec::new();
+        let mut seen = HashSet::new();
         let mut cur = Some(name.to_string());
         while let Some(c) = cur {
+            if !seen.insert(c.clone()) {
+                break;
+            }
             chain.push(c.clone());
             cur = self.nodes.get(&c).and_then(|n| n.parent.clone());
         }
@@ -241,7 +281,12 @@ impl StackGraph {
         let root = self
             .path_from_trunk(name)
             .into_iter()
-            .find(|b| self.nodes.get(b).map(|n| n.parent.is_some()).unwrap_or(false))
+            .find(|b| {
+                self.nodes
+                    .get(b)
+                    .map(|n| n.parent.is_some())
+                    .unwrap_or(false)
+            })
             .unwrap_or_else(|| name.to_string());
         self.subtree(&root)
     }
@@ -348,4 +393,53 @@ fn batch_existing(shas: &[String]) -> Result<HashSet<String>> {
         }
     }
     Ok(set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(name: &str, parent: Option<&str>, validation: Validation) -> BranchNode {
+        BranchNode {
+            name: name.to_string(),
+            tip: format!("{name}-tip"),
+            meta: parent.map(|p| BranchMetadata::new(p, "base-rev")),
+            validation,
+            parent: parent.map(str::to_string),
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn metadata_cycle_is_not_valid() {
+        let mut heads = HashMap::new();
+        heads.insert("main".to_string(), "main-tip".to_string());
+        heads.insert("alpha".to_string(), "alpha-tip".to_string());
+        heads.insert("beta".to_string(), "beta-tip".to_string());
+
+        let live_revs = HashSet::from(["base-rev".to_string()]);
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "main".to_string(),
+            node("main", None, Validation::Untracked),
+        );
+        nodes.insert(
+            "alpha".to_string(),
+            node("alpha", Some("beta"), Validation::Untracked),
+        );
+        nodes.insert(
+            "beta".to_string(),
+            node("beta", Some("alpha"), Validation::Untracked),
+        );
+
+        let mut graph = StackGraph {
+            nodes,
+            trunk: "main".to_string(),
+            current: Some("alpha".to_string()),
+        };
+        graph.validate(&heads, &live_revs);
+
+        assert_ne!(graph.nodes["alpha"].validation, Validation::Valid);
+        assert_ne!(graph.nodes["beta"].validation, Validation::Valid);
+    }
 }

@@ -16,12 +16,30 @@ pub struct Output {
     pub code: i32,
 }
 
+/// Fully-qualified local branch ref.
+pub fn head_ref(name: &str) -> String {
+    format!("refs/heads/{name}")
+}
+
+/// Push refspec for updating exactly one branch with the same local/remote name.
+pub fn head_refspec(name: &str) -> String {
+    let r = head_ref(name);
+    format!("{r}:{r}")
+}
+
 /// Run `git <args>`; error if the exit status is non-zero.
 pub fn run(args: &[&str]) -> Result<String> {
     let out = run_allow_fail(args)?;
     if out.code != 0 {
-        let detail = if out.stderr.is_empty() { &out.stdout } else { &out.stderr };
-        return Err(GtError::Git(format!("git {} failed:\n{detail}", args.join(" "))));
+        let detail = if out.stderr.is_empty() {
+            &out.stdout
+        } else {
+            &out.stderr
+        };
+        return Err(GtError::Git(format!(
+            "git {} failed:\n{detail}",
+            args.join(" ")
+        )));
     }
     Ok(out.stdout)
 }
@@ -33,8 +51,12 @@ pub fn run_allow_fail(args: &[&str]) -> Result<Output> {
         .output()
         .map_err(|e| GtError::Git(format!("failed to spawn git: {e}")))?;
     Ok(Output {
-        stdout: String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string(),
-        stderr: String::from_utf8_lossy(&out.stderr).trim_end_matches('\n').to_string(),
+        stdout: String::from_utf8_lossy(&out.stdout)
+            .trim_end_matches('\n')
+            .to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr)
+            .trim_end_matches('\n')
+            .to_string(),
         code: out.status.code().unwrap_or(-1),
     })
 }
@@ -70,7 +92,9 @@ pub fn run_with_stdin_raw(args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
 /// Like [`run_with_stdin_raw`] but returns trimmed stdout as a string.
 pub fn run_with_stdin(args: &[&str], input: &[u8]) -> Result<String> {
     let bytes = run_with_stdin_raw(args, input)?;
-    Ok(String::from_utf8_lossy(&bytes).trim_end_matches('\n').to_string())
+    Ok(String::from_utf8_lossy(&bytes)
+        .trim_end_matches('\n')
+        .to_string())
 }
 
 /// Run `git <args>` with inherited stdio (for rebase / editors). Returns the exit code.
@@ -138,7 +162,11 @@ pub fn git_dir() -> Result<PathBuf> {
 /// Currently checked-out branch, or `None` if HEAD is detached.
 pub fn current_branch() -> Result<Option<String>> {
     let out = run_allow_fail(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-    Ok(if out.code == 0 { Some(out.stdout) } else { None })
+    Ok(if out.code == 0 {
+        Some(out.stdout)
+    } else {
+        None
+    })
 }
 
 fn verify(spec: &str) -> Result<Option<String>> {
@@ -163,26 +191,28 @@ pub fn ref_exists(reference: &str) -> Result<bool> {
 
 /// Whether a local branch exists.
 pub fn branch_exists(name: &str) -> Result<bool> {
-    ref_exists(&format!("refs/heads/{name}"))
+    ref_exists(&head_ref(name))
 }
 
 /// Tip SHA of a local branch.
 pub fn branch_tip(name: &str) -> Result<String> {
-    rev_parse_opt(&format!("refs/heads/{name}"))?
+    rev_parse_opt(&head_ref(name))?
         .ok_or_else(|| GtError::Git(format!("branch `{name}` does not exist")))
 }
 
 /// Switch to `branch` if it exists; otherwise do nothing.
 pub fn switch_if_exists(branch: &str) -> Result<()> {
     if branch_exists(branch)? {
-        run(&["switch", branch])?;
+        run(&["switch", "--", branch])?;
     }
     Ok(())
 }
 
 /// `git merge-base <a> <b>`.
 pub fn merge_base(a: &str, b: &str) -> Result<String> {
-    run(&["merge-base", a, b])
+    let a_ref = head_ref(a);
+    let b_ref = head_ref(b);
+    run(&["merge-base", &a_ref, &b_ref])
 }
 
 /// Whether `a` is an ancestor of `b`.
@@ -215,5 +245,9 @@ pub fn rebase_in_progress(git_dir: &Path) -> bool {
 /// Files with unresolved merge conflicts.
 pub fn conflicted_files() -> Result<Vec<String>> {
     let out = run(&["diff", "--name-only", "--diff-filter=U"])?;
-    Ok(out.lines().map(str::to_string).filter(|s| !s.is_empty()).collect())
+    Ok(out
+        .lines()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .collect())
 }

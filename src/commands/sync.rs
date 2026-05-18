@@ -22,6 +22,10 @@ pub fn run() -> Result<()> {
 
     // Reload after the trunk moved.
     let graph = StackGraph::load()?;
+    let mut rollback_branches: Vec<String> =
+        graph.tracked().into_iter().map(str::to_string).collect();
+    rollback_branches.push(trunk.clone());
+    let rollback_snapshot = rebase::snapshot_branches(&graph, &rollback_branches)?;
 
     // Find merged / closed branches and confirm each deletion.
     let mut to_delete: Vec<String> = Vec::new();
@@ -46,7 +50,7 @@ pub fn run() -> Result<()> {
         Some(b) if git::branch_exists(b)? => b.clone(),
         _ => trunk.clone(),
     };
-    git::run(&["switch", &landing])?;
+    git::run(&["switch", "--", &landing])?;
 
     let survivors = StackGraph::load()?;
     let roots: Vec<String> = survivors
@@ -57,18 +61,24 @@ pub fn run() -> Result<()> {
         println!("nothing left to restack");
         return Ok(());
     }
-    rebase::restack(&roots, "sync")
+    let mut plan = rebase::plan(&survivors, &roots, "sync")?;
+    if plan.chains.is_empty() {
+        println!("the stack is already up to date");
+        return Ok(());
+    }
+    plan.snapshot = rollback_snapshot;
+    rebase::start(&survivors, plan)
 }
 
 /// Fast-forward the trunk branch to its remote tip, if possible.
 fn fast_forward_trunk(trunk: &str) -> Result<()> {
-    let remote_ref = format!("origin/{trunk}");
+    let remote_ref = format!("refs/remotes/origin/{trunk}");
     if git::rev_parse_opt(&remote_ref)?.is_none() {
         println!("no `{remote_ref}`; skipping trunk update");
         return Ok(());
     }
     let before = git::current_branch()?;
-    git::run(&["switch", trunk])?;
+    git::run(&["switch", "--", trunk])?;
     let res = git::run_allow_fail(&["merge", "--ff-only", &remote_ref])?;
     if res.code == 0 {
         println!("updated `{trunk}`");
@@ -77,7 +87,7 @@ fn fast_forward_trunk(trunk: &str) -> Result<()> {
     }
     if let Some(b) = before {
         if b != trunk {
-            let _ = git::run(&["switch", &b]);
+            let _ = git::run(&["switch", "--", &b]);
         }
     }
     Ok(())
@@ -104,11 +114,10 @@ fn merged_reason(graph: &StackGraph, branch: &str) -> Result<Option<String>> {
     }
 
     // Fallback: every commit is already present on the trunk (patch-id match).
-    let cherry = git::run_allow_fail(&["cherry", &graph.trunk, branch])?;
-    if cherry.code == 0
-        && !cherry.stdout.is_empty()
-        && !cherry.stdout.lines().any(|l| l.starts_with('+'))
-    {
+    let trunk_ref = git::head_ref(&graph.trunk);
+    let branch_ref = git::head_ref(branch);
+    let cherry = git::run_allow_fail(&["cherry", &trunk_ref, &branch_ref])?;
+    if cherry.code == 0 && !cherry.stdout.lines().any(|l| l.starts_with('+')) {
         return Ok(Some("commits already on trunk".into()));
     }
     Ok(None)
@@ -142,7 +151,7 @@ fn delete_branches(graph: &StackGraph, to_delete: &[String], trunk: &str) -> Res
     // Never delete the checked-out branch.
     if let Some(cur) = git::current_branch()? {
         if del.contains(cur.as_str()) {
-            git::run(&["switch", trunk])?;
+            git::run(&["switch", "--", trunk])?;
         }
     }
 
@@ -150,10 +159,14 @@ fn delete_branches(graph: &StackGraph, to_delete: &[String], trunk: &str) -> Res
         let Some(node) = graph.get(b) else { continue };
         // Keep the deleted branch recoverable: a backup ref under
         // refs/oh-my-gt/deleted/ holds its tip and survives `git gc`.
-        let _ = git::run(&["update-ref", &format!("refs/oh-my-gt/deleted/{b}"), &node.tip]);
-        git::run(&["branch", "-D", b])?;
+        let _ = git::run(&[
+            "update-ref",
+            &format!("refs/oh-my-gt/deleted/{b}"),
+            &node.tip,
+        ]);
+        git::run(&["branch", "-D", "--", b])?;
         meta::delete(b)?;
-        println!("deleted `{b}` (restore: git branch {b} {})", node.tip);
+        println!("deleted `{b}` (restore: git branch -- {b} {})", node.tip);
     }
     Ok(())
 }
