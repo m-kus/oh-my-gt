@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Minimal `gh` mock for oh-my-gt e2e tests.
+#
+# Implements just the surface oh-my-gt uses: `gh pr view/create/edit`.
+# All state lives under $FAKE_GH_STATE so a run is fully reproducible and
+# offline. Each PR is one file `pr_<branch>` with NUM/BASE/STATE/TITLE.
+set -u
+
+DIR="${FAKE_GH_STATE:?FAKE_GH_STATE is not set}"
+mkdir -p "$DIR"
+
+[ "${1:-}" = "pr" ] || { echo "fake_gh: unsupported command: $*" >&2; exit 2; }
+sub="${2:-}"
+shift 2 2>/dev/null || true
+
+case "$sub" in
+  view)
+    branch="${1:-}"
+    f="$DIR/pr_$branch"
+    if [ -f "$f" ]; then
+      # shellcheck disable=SC1090
+      . "$f"
+      printf '{"number":%s,"url":"https://example.test/pr/%s","baseRefName":"%s","state":"%s","title":"%s"}\n' \
+        "$NUM" "$NUM" "$BASE" "$STATE" "$TITLE"
+      exit 0
+    fi
+    echo "no pull requests found for branch \"$branch\"" >&2
+    exit 1
+    ;;
+
+  create)
+    head="" base="" title=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head)  head="$2";  shift 2 ;;
+        --base)  base="$2";  shift 2 ;;
+        --title) title="$2"; shift 2 ;;
+        --body)  shift 2 ;;
+        *)       shift ;;
+      esac
+    done
+    counter="$DIR/.counter"
+    n=$(cat "$counter" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "$counter"
+    {
+      echo "NUM=$n"
+      echo "BASE=$base"
+      echo "STATE=OPEN"
+      echo "TITLE=\"$title\""
+    } > "$DIR/pr_$head"
+    echo "https://example.test/pr/$n"
+    exit 0
+    ;;
+
+  edit)
+    num="${1:-}"
+    shift 2>/dev/null || true
+    base=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --base) base="$2"; shift 2 ;;
+        *)      shift ;;
+      esac
+    done
+    for f in "$DIR"/pr_*; do
+      [ -f "$f" ] || continue
+      # shellcheck disable=SC1090
+      ( . "$f"
+        if [ "$NUM" = "$num" ]; then
+          {
+            echo "NUM=$NUM"
+            echo "BASE=${base:-$BASE}"
+            echo "STATE=$STATE"
+            echo "TITLE=\"$TITLE\""
+          } > "$f"
+        fi )
+    done
+    exit 0
+    ;;
+
+  *)
+    echo "fake_gh: unsupported pr subcommand: $sub" >&2
+    exit 2
+    ;;
+esac

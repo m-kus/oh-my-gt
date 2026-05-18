@@ -1,0 +1,12 @@
+# step: create-alpha (exit=0)
+HEAD: alpha
+rebase: none
+status:
+branches:
+  alpha -> @alpha-feature tree=e7a6795824337bf7b6300a422b9b33ba4a97e8a3
+  main -> @root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0
+commits:
+@alpha-feature tree=e7a6795824337bf7b6300a422b9b33ba4a97e8a3 parents=[@root-commit] alpha feature
+@root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
+metadata:
+  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit"}

@@ -1,0 +1,15 @@
+# step: move-alpha-onto-beta (exit=0)
+HEAD: alpha
+rebase: none
+status:
+branches:
+  alpha -> @alpha-feature tree=6476fd8b0607b3401632fc9dea1f5282cc0fcdf9
+  beta -> @beta-feature tree=1123c87a6f1615b1f52143836e452a46914f9994
+  main -> @root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0
+commits:
+@alpha-feature tree=6476fd8b0607b3401632fc9dea1f5282cc0fcdf9 parents=[@beta-feature] alpha feature
+@beta-feature tree=1123c87a6f1615b1f52143836e452a46914f9994 parents=[@root-commit] beta feature
+@root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
+metadata:
+  alpha: {"parentBranchName":"beta","parentBranchRevision":"@beta-feature"}
+  beta: {"parentBranchName":"main","parentBranchRevision":"@root-commit"}
