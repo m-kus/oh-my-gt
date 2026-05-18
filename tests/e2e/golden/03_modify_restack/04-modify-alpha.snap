@@ -1,0 +1,18 @@
+# step: modify-alpha (exit=0)
+HEAD: alpha
+rebase: none
+status:
+branches:
+  alpha -> @alpha-feature tree=271b8e1e4f9ae7eff6c13f226456449081cc2aa5
+  beta -> @beta-feature tree=3e68022f4aee3b607aca39653b369b424e1e4ecc
+  gamma -> @gamma-feature tree=0462dab253533c63d2513ab0203ba5d0feaade10
+  main -> @root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0
+commits:
+@alpha-feature tree=271b8e1e4f9ae7eff6c13f226456449081cc2aa5 parents=[@root-commit] alpha feature
+@beta-feature tree=3e68022f4aee3b607aca39653b369b424e1e4ecc parents=[@alpha-feature] beta feature
+@gamma-feature tree=0462dab253533c63d2513ab0203ba5d0feaade10 parents=[@beta-feature] gamma feature
+@root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
+metadata:
+  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit"}
+  beta: {"parentBranchName":"alpha","parentBranchRevision":"@alpha-feature"}
+  gamma: {"parentBranchName":"beta","parentBranchRevision":"@beta-feature"}

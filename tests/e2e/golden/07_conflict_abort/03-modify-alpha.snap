@@ -1,0 +1,19 @@
+# step: modify-alpha (exit=1)
+HEAD: (detached)
+rebase: IN-PROGRESS
+conflicts:
+  shared.txt
+status:
+  UU shared.txt
+branches:
+  alpha -> @alpha-feature-93af00 tree=93af0039c88ac1eb718d12ad051052b0aaf8fa99
+  beta -> @beta-feature tree=c8546cee277035eb7748247508decbf6e7ea7a8d
+  main -> @root-commit tree=c010266bc762d5b330b0ed22edf3694cec0b81d1
+commits:
+@alpha-feature-93af00 tree=93af0039c88ac1eb718d12ad051052b0aaf8fa99 parents=[@root-commit] alpha feature
+@alpha-feature-36f0e0 tree=36f0e0fc6f49c4fc8fbe79a732604f308af8a696 parents=[@root-commit] alpha feature
+@beta-feature tree=c8546cee277035eb7748247508decbf6e7ea7a8d parents=[@alpha-feature-36f0e0] beta feature
+@root-commit tree=c010266bc762d5b330b0ed22edf3694cec0b81d1 parents=[] root commit
+metadata:
+  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit"}
+  beta: {"parentBranchName":"alpha","parentBranchRevision":"@alpha-feature-36f0e0"}

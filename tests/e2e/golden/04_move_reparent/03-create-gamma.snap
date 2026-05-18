@@ -1,0 +1,18 @@
+# step: create-gamma (exit=0)
+HEAD: gamma
+rebase: none
+status:
+branches:
+  alpha -> @alpha-feature tree=e7a6795824337bf7b6300a422b9b33ba4a97e8a3
+  beta -> @beta-feature tree=1123c87a6f1615b1f52143836e452a46914f9994
+  gamma -> @gamma-feature tree=1102b6a49a57de33fbbd92c3fa7d838632f68743
+  main -> @root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0
+commits:
+@alpha-feature tree=e7a6795824337bf7b6300a422b9b33ba4a97e8a3 parents=[@root-commit] alpha feature
+@beta-feature tree=1123c87a6f1615b1f52143836e452a46914f9994 parents=[@root-commit] beta feature
+@gamma-feature tree=1102b6a49a57de33fbbd92c3fa7d838632f68743 parents=[@root-commit] gamma feature
+@root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
+metadata:
+  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit"}
+  beta: {"parentBranchName":"main","parentBranchRevision":"@root-commit"}
+  gamma: {"parentBranchName":"main","parentBranchRevision":"@root-commit"}

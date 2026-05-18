@@ -1,0 +1,22 @@
+[package]
+name = "oh-my-gt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "A fast, low-dependency subset of the Graphite CLI for stacked PRs"
+license = "MIT"
+
+[[bin]]
+name = "gt"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

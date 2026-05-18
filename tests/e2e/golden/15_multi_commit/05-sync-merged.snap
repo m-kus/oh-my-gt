@@ -1,0 +1,21 @@
+# step: sync-merged (exit=0)
+HEAD: beta
+rebase: none
+status:
+branches:
+  beta -> @beta-third-0d550e tree=0d550e8783a9b33204f2b297e81d3fcd163f5ae9
+  main -> @merge-alpha tree=a3ab55dff8ee3d563c58419c274a92adf39830b7
+commits:
+@alpha-first tree=43d252e5261405f01093f99659fe41b97b7a08ac parents=[@root-commit] alpha first
+@alpha-second-e54b8f tree=e54b8f19770cf9f4524315a494fa1841c9119d86 parents=[@alpha-first] alpha second
+@alpha-second-a3ab55 tree=a3ab55dff8ee3d563c58419c274a92adf39830b7 parents=[@alpha-first] alpha second
+@beta-first-b9b6bb tree=b9b6bbdbbada31801a72b00c89d9fbaf7e7dc087 parents=[@alpha-second-e54b8f] beta first
+@beta-first-1f075d tree=1f075d8ba537164b14bb016b6707a661ff13f59c parents=[@merge-alpha] beta first
+@beta-second-b245ab tree=b245abb60d0c229d15a8e02eb67d6fc92bf6838c parents=[@beta-first-b9b6bb] beta second
+@beta-second-90a7d7 tree=90a7d79a231c784af6f0a4fe4899bb1a5d70708c parents=[@beta-first-1f075d] beta second
+@beta-third-0d550e tree=0d550e8783a9b33204f2b297e81d3fcd163f5ae9 parents=[@beta-second-90a7d7] beta third
+@beta-third-ba5aa2 tree=ba5aa2276d323187f2aed6d53912dd0d251e6a23 parents=[@beta-second-b245ab] beta third
+@merge-alpha tree=a3ab55dff8ee3d563c58419c274a92adf39830b7 parents=[@root-commit @alpha-second-a3ab55] merge alpha
+@root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
+metadata:
+  beta: {"parentBranchName":"main","parentBranchRevision":"@merge-alpha","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"beta third","state":"OPEN"}}
