@@ -15,4 +15,5 @@ step create-gamma create "gamma feature" gamma
 
 co alpha
 append alpha.txt a-extra
-step modify-alpha modify y n
+git add alpha.txt
+step modify-alpha modify

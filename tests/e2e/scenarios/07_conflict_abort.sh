@@ -12,7 +12,8 @@ step create-beta create "beta feature" beta
 
 co alpha
 write shared.txt FA
-step modify-alpha modify y n
+git add shared.txt
+step modify-alpha modify
 
 # Abort: branches return to their pre-restack state.
 step abort-restack abort

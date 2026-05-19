@@ -20,7 +20,8 @@ step submit submit
 # Amend alpha's tip commit; beta's three commits must all restack.
 co alpha
 append alpha2.txt a2-extra
-step modify-alpha modify y n
+git add alpha2.txt
+step modify-alpha modify
 
 # Merge alpha (two commits) on the remote, then sync.
 co main
