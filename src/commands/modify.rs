@@ -2,7 +2,7 @@
 
 use crate::error::{GtError, Result};
 use crate::graph::StackGraph;
-use crate::{git, prompt, rebase};
+use crate::{git, rebase};
 
 pub fn run() -> Result<()> {
     let (graph, current) = StackGraph::load_current()?;
@@ -21,24 +21,17 @@ pub fn run() -> Result<()> {
         )));
     }
 
-    if !git::status_porcelain()?.is_empty()
-        && prompt::confirm("stage all changes before amending?", true)?
-    {
-        git::run(&["add", "-A"])?;
+    if !git::has_staged_changes()? {
+        return Err(GtError::Precondition(
+            "no staged changes; stage something with `git add` first".into(),
+        ));
     }
 
-    if !git::has_staged_changes()?
-        && !prompt::confirm("nothing staged; amend just the commit message?", false)?
-    {
-        return Err(GtError::Aborted);
+    if git::has_unstaged_changes()? {
+        println!("warning: unstaged changes will not be included in the amend");
     }
 
-    let args: &[&str] = if prompt::confirm("edit the commit message?", false)? {
-        &["commit", "--amend"]
-    } else {
-        &["commit", "--amend", "--no-edit"]
-    };
-    if git::run_interactive(args)? != 0 {
+    if git::run_interactive(&["commit", "--amend", "--no-edit"])? != 0 {
         return Err(GtError::Git("`git commit --amend` failed".into()));
     }
 

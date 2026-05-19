@@ -183,6 +183,10 @@ impl TestRepo {
         .status
         .success()
     }
+
+    fn head(&self) -> String {
+        self.git(&["rev-parse", "HEAD"])
+    }
 }
 
 impl Drop for TestRepo {
@@ -279,4 +283,74 @@ fn sync_deletes_branch_whose_commits_are_already_on_trunk_without_pr_metadata() 
         !repo.local_branch_exists("alpha"),
         "sync should delete a tracked branch that has no commits left outside trunk"
     );
+}
+
+#[test]
+fn modify_amends_staged_changes_without_editing_message() {
+    let repo = TestRepo::new("modify-staged-only");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+
+    repo.write("alpha.txt", "alpha\namended\n");
+    repo.git(&["add", "alpha.txt"]);
+    let out = repo.gt("modify", "");
+
+    assert_success(&out, "gt modify");
+    assert_eq!(repo.git(&["log", "-1", "--pretty=%s"]), "alpha feature");
+    assert_eq!(repo.git(&["show", "HEAD:alpha.txt"]), "alpha\namended");
+    assert!(repo.git(&["status", "--porcelain"]).is_empty());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("stage all changes before amending?"));
+    assert!(!stdout.contains("edit the commit message?"));
+}
+
+#[test]
+fn modify_warns_and_leaves_unstaged_changes_out_of_amend() {
+    let repo = TestRepo::new("modify-staged-plus-unstaged");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+
+    repo.write("alpha.txt", "alpha\nstaged\n");
+    repo.git(&["add", "alpha.txt"]);
+    repo.write("alpha.txt", "alpha\nstaged\nunstaged\n");
+    repo.write("scratch.txt", "scratch\n");
+    let out = repo.gt("modify", "");
+
+    assert_success(&out, "gt modify");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("warning: unstaged changes will not be included in the amend"));
+    assert_eq!(repo.git(&["log", "-1", "--pretty=%s"]), "alpha feature");
+    assert_eq!(repo.git(&["show", "HEAD:alpha.txt"]), "alpha\nstaged");
+    let status = repo.git(&["status", "--porcelain"]);
+    assert!(
+        status.lines().any(|line| line == " M alpha.txt"),
+        "expected unstaged edit to remain, got status:\n{status}"
+    );
+    assert!(
+        status.lines().any(|line| line == "?? scratch.txt"),
+        "expected untracked file to remain, got status:\n{status}"
+    );
+}
+
+#[test]
+fn modify_errors_without_staged_changes_before_mutating() {
+    let repo = TestRepo::new("modify-nothing-staged");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    let before = repo.head();
+
+    repo.write("alpha.txt", "alpha\nunstaged\n");
+    let out = repo.gt("modify", "");
+
+    assert!(
+        !out.status.success(),
+        "gt modify should fail with nothing staged"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no staged changes; stage something with `git add` first"));
+    assert_eq!(repo.head(), before);
+    assert_eq!(repo.git(&["show", "HEAD:alpha.txt"]), "alpha");
 }

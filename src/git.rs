@@ -237,6 +237,13 @@ pub fn has_staged_changes() -> Result<bool> {
     Ok(out.code != 0)
 }
 
+/// Whether the working tree has unstaged or untracked changes.
+pub fn has_unstaged_changes() -> Result<bool> {
+    Ok(status_porcelain()?.lines().any(|line| {
+        line.starts_with("??") || line.as_bytes().get(1).map(|b| *b != b' ').unwrap_or(false)
+    }))
+}
+
 /// Whether a rebase is currently in progress.
 pub fn rebase_in_progress(git_dir: &Path) -> bool {
     git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
