@@ -70,7 +70,11 @@ fn slugify(message: &str) -> String {
         }
     }
     let slug = slug.trim_end_matches('-');
-    let trimmed: String = slug.chars().take(40).collect();
+    // Default branch names should stay descriptive for the long-but-reasonable
+    // commit messages stacked-PR users tend to write. 80 chars matches the
+    // soft column limit most editors lean on, while staying well below the
+    // ~250-char filesystem ref-path budget git itself imposes.
+    let trimmed: String = slug.chars().take(80).collect();
     if trimmed.is_empty() {
         "branch".to_string()
     } else {
@@ -87,5 +91,32 @@ mod tests {
         assert_eq!(slugify("Add user login flow"), "add-user-login-flow");
         assert_eq!(slugify("  Fix: the thing!! "), "fix-the-thing");
         assert_eq!(slugify("***"), "branch");
+    }
+
+    #[test]
+    fn slugify_keeps_long_messages_descriptive_but_capped() {
+        // A long-but-reasonable subject should keep more than the old 40-char
+        // budget so the default branch name stays useful, while still being
+        // deterministically truncated below the ~250-char ref-path budget.
+        let msg = "Add a thorough multi-stage login flow with optional two-factor authentication and recovery codes for legacy users";
+        let slug = slugify(msg);
+        assert!(
+            slug.len() > 40,
+            "slug should be longer than the previous 40-char cap; got `{slug}` ({} chars)",
+            slug.len()
+        );
+        assert!(
+            slug.len() <= 80,
+            "slug must stay bounded at the new cap; got `{slug}` ({} chars)",
+            slug.len()
+        );
+        // Truncation is deterministic: slugify the same message twice and you
+        // get the same prefix, and that prefix is just the first-80-chars cut
+        // of the full slug with any trailing dash trimmed.
+        assert_eq!(slug, slugify(msg));
+        assert_eq!(
+            slug,
+            "add-a-thorough-multi-stage-login-flow-with-optional-two-factor-authentication-an"
+        );
     }
 }
