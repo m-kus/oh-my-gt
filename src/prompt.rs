@@ -1,7 +1,9 @@
 //! Minimal interactive prompts read from stdin. Commands take no flags, so any
 //! input a command needs is gathered here.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::error::{GtError, Result};
 use crate::tree::TreeLine;
@@ -53,6 +55,115 @@ pub fn confirm(question: &str, default: bool) -> Result<bool> {
 /// caller's keystrokes are preserved verbatim.
 pub fn input(prompt: &str, default: Option<&str>) -> Result<String> {
     input_inner(prompt, default, /* preserve */ false)
+}
+
+/// Collect a commit message from the user.
+///
+/// When stdin is a real terminal, launch the user's editor (`$VISUAL`, then
+/// `$EDITOR`, falling back to `vi`) against a temporary file pre-seeded with
+/// git-style comment lines. On editor success, comment lines are stripped and
+/// the remaining message is trimmed; an empty result becomes a clear error.
+///
+/// When stdin is *not* a terminal (e.g. the e2e harness pipes the message in),
+/// fall back to a single-line stdin read so non-interactive callers keep
+/// working without needing a flag.
+pub fn editor_message(prompt: &str) -> Result<String> {
+    if !io::stdin().is_terminal() {
+        // Non-interactive caller (tests, scripts) — preserve the historical
+        // behavior of reading one trimmed line.
+        return input(prompt, None);
+    }
+    editor_message_interactive()
+}
+
+/// Drive the configured editor against a fresh template file and return the
+/// parsed message. Split out so the interactive path stays readable and the
+/// cleanup happens in exactly one place.
+fn editor_message_interactive() -> Result<String> {
+    let path = make_temp_path("COMMIT_EDITMSG");
+    std::fs::write(&path, EDITOR_TEMPLATE)?;
+
+    let result = run_editor(&path).and_then(|()| {
+        let raw = std::fs::read_to_string(&path)?;
+        parse_editor_message(&raw)
+    });
+
+    // Best-effort cleanup: the temp file lives under the OS temp dir, so a
+    // failure to remove it is not worth aborting the user's command over.
+    let _ = std::fs::remove_file(&path);
+
+    result
+}
+
+/// Pre-seeded template for the editor buffer. Mirrors the look of git's own
+/// `COMMIT_EDITMSG` so the experience feels familiar.
+const EDITOR_TEMPLATE: &str = "\n\
+    # Please enter the commit message for your branch.\n\
+    # Lines starting with '#' will be ignored, and an empty message aborts\n\
+    # the command.\n";
+
+/// Spawn the configured editor against `path`, inheriting the terminal so the
+/// user can interact with it. A non-zero exit is treated as cancellation.
+fn run_editor(path: &Path) -> Result<()> {
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".to_string());
+
+    // Use the shell to honor editor settings like `code --wait` that bake
+    // arguments into $EDITOR — matches git's own behavior. The temp path is
+    // appended as a separate argv entry so its spaces are safe.
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(&editor) // becomes $0
+        .arg(path)
+        .status()
+        .map_err(|e| GtError::Usage(format!("failed to launch editor `{editor}`: {e}")))?;
+
+    if !status.success() {
+        return Err(GtError::Aborted);
+    }
+    Ok(())
+}
+
+/// Strip `#`-prefixed comment lines and surrounding whitespace; reject an
+/// empty result with a clear error. Pulled out so it can be unit-tested
+/// without spawning an editor.
+fn parse_editor_message(raw: &str) -> Result<String> {
+    let mut out = String::new();
+    for line in raw.lines() {
+        // Git's rule: a leading `#` (no surrounding whitespace stripped first)
+        // marks a comment. Keeping the same rule means users can paste git
+        // commit templates here verbatim.
+        if line.starts_with('#') {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let trimmed = out.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(GtError::Usage("empty commit message — aborting".into()));
+    }
+    Ok(trimmed)
+}
+
+/// Build a unique path under `std::env::temp_dir()`. We avoid the `tempfile`
+/// crate to keep the dependency footprint at `serde`/`serde_json` only.
+fn make_temp_path(label: &str) -> PathBuf {
+    let pid = std::process::id();
+    // Nanos since the epoch is plenty of entropy for a single-process tool.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("oh-my-gt-{pid}-{nanos}-{label}"))
 }
 
 /// Prompt for a branch name, preserving the user's input exactly (only the
@@ -326,6 +437,54 @@ mod tests {
         assert_eq!(read_preserving_from(b"feature\n"), "feature");
         // No terminator at EOF is fine, too.
         assert_eq!(read_preserving_from(b"feature"), "feature");
+    }
+
+    #[test]
+    fn parse_editor_strips_comments_and_trims() {
+        // Mixed body + comment lines: comments drop out, surrounding blank
+        // lines are trimmed, the message body is preserved verbatim.
+        let raw = "\nFix login flow\n\nResolves the regression.\n\
+                   # Please enter the commit message for your branch.\n\
+                   # Lines starting with '#' will be ignored.\n";
+        let parsed = parse_editor_message(raw).unwrap();
+        assert_eq!(parsed, "Fix login flow\n\nResolves the regression.");
+    }
+
+    #[test]
+    fn parse_editor_keeps_indented_hashes() {
+        // Only a leading `#` (column 0) is a comment. An indented `#` is part
+        // of the body — matches git's own rule, so pasting "#42 in markdown"
+        // works as long as the user indents it.
+        let raw = "Title\n\n See #42 for context.\n";
+        let parsed = parse_editor_message(raw).unwrap();
+        assert_eq!(parsed, "Title\n\n See #42 for context.");
+    }
+
+    #[test]
+    fn parse_editor_rejects_empty() {
+        // Whitespace-only and comments-only buffers both count as empty —
+        // the user got the editor up and decided not to write anything.
+        for raw in [
+            "",
+            "\n\n  \n",
+            "# only comments\n# more comments\n",
+            "   \n\t\n",
+        ] {
+            let e = parse_editor_message(raw).unwrap_err();
+            assert!(
+                matches!(&e, GtError::Usage(m) if m.contains("empty commit message")),
+                "input {raw:?} produced {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_editor_trims_trailing_whitespace() {
+        // Trailing blank lines (common after editor save) are stripped but
+        // interior blank lines (e.g. between subject and body) survive.
+        let raw = "Subject line\n\nBody paragraph.\n\n\n";
+        let parsed = parse_editor_message(raw).unwrap();
+        assert_eq!(parsed, "Subject line\n\nBody paragraph.");
     }
 
     #[test]
