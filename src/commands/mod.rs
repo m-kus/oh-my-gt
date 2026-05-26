@@ -10,4 +10,5 @@ pub mod restack;
 pub mod submit;
 pub mod sync;
 pub mod track;
+pub mod tree;
 pub mod untrack;

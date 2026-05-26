@@ -26,7 +26,8 @@ rebase control:
   abort      undo an in-progress operation
 
 other:
-  log        show the current stack
+  log        show the current stack (with commit SHAs and restack markers)
+  tree       show the current stack as a focused branch tree
   help       show this message
 ";
 
@@ -79,6 +80,7 @@ pub fn run() -> Result<()> {
         "continue" => commands::continue_::run(),
         "abort" => commands::abort::run(),
         "log" => commands::log::run(),
+        "tree" => commands::tree::run(),
         other => Err(GtError::Usage(format!(
             "unknown command `{other}`\n\n{USAGE}"
         ))),

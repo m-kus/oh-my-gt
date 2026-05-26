@@ -15,6 +15,7 @@ mod prompt;
 mod rebase;
 mod state;
 mod style;
+mod tree;
 mod trunk;
 
 use error::GtError;
