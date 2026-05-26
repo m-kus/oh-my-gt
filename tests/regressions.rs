@@ -774,6 +774,92 @@ fn submit_sends_empty_body_for_single_line_commit_message() {
     assert_eq!(body, "", "single-line commit must produce an empty PR body");
 }
 
+#[test]
+fn submit_appends_stack_overview_with_current_pr_marker() {
+    // A multi-branch stack must produce one PR body per branch that contains
+    // the marker block, every branch link in the chain, and an arrow next to
+    // the current branch's line. A re-submit after adding another branch
+    // must update every body to include the new entry, and user content
+    // written outside the markers must survive the rewrite.
+    let repo = TestRepo::new("submit-stack-overview");
+    repo.add_origin();
+
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    repo.create_with_gt("beta feature", "beta", "beta.txt", "beta\n");
+
+    let out = repo.gt("submit", "");
+    assert_success(&out, "gt submit (initial)");
+
+    let body_alpha = fs::read_to_string(repo.root.join("ghstate/body_alpha")).unwrap();
+    let body_beta = fs::read_to_string(repo.root.join("ghstate/body_beta")).unwrap();
+    for (branch, body) in [("alpha", &body_alpha), ("beta", &body_beta)] {
+        assert!(
+            body.contains("<!-- gt-stack-start -->") && body.contains("<!-- gt-stack-end -->"),
+            "body for `{branch}` missing markers:\n{body}"
+        );
+        // Each row is a bare PR URL so GitHub renders title + status badges.
+        // The current-PR marker is the 👈 emoji appended after the URL.
+        assert!(
+            body.contains("- https://example.test/pr/1"),
+            "body for `{branch}` missing alpha PR URL:\n{body}"
+        );
+        assert!(
+            body.contains("- https://example.test/pr/2"),
+            "body for `{branch}` missing beta PR URL:\n{body}"
+        );
+        assert!(
+            !body.contains("](https://example.test/pr/"),
+            "body for `{branch}` must use bare URLs, not markdown links:\n{body}"
+        );
+        // Trunk is shown as the bottom row, in backticks, since it has no PR.
+        assert!(
+            body.contains("- `main`"),
+            "body for `{branch}` missing trunk row:\n{body}"
+        );
+    }
+    assert!(
+        body_alpha.contains("- https://example.test/pr/1 👈"),
+        "alpha body must mark its own PR URL as current:\n{body_alpha}"
+    );
+    assert!(
+        body_beta.contains("- https://example.test/pr/2 👈"),
+        "beta body must mark its own PR URL as current:\n{body_beta}"
+    );
+
+    // Simulate the user editing the PR body on GitHub outside the markers,
+    // then add a third branch and re-submit. The user prose must survive and
+    // the section must update to include the new branch.
+    let preserved = "User wrote this prose above the section.\n\nAnd kept this paragraph too.";
+    let edited = format!("{preserved}\n\n{}", body_beta.trim());
+    fs::write(repo.root.join("ghstate/body_beta"), &edited).unwrap();
+
+    repo.create_with_gt("gamma feature", "gamma", "gamma.txt", "gamma\n");
+    let out = repo.gt("submit", "");
+    assert_success(&out, "gt submit (after gamma)");
+
+    let body_beta_after = fs::read_to_string(repo.root.join("ghstate/body_beta")).unwrap();
+    assert!(
+        body_beta_after.starts_with("User wrote this prose above the section."),
+        "user prose outside the markers must survive re-submit; got:\n{body_beta_after}"
+    );
+    assert!(
+        body_beta_after.contains("And kept this paragraph too."),
+        "user prose must not be truncated; got:\n{body_beta_after}"
+    );
+    assert!(
+        body_beta_after.contains("- https://example.test/pr/3"),
+        "stack section must list the newly-added branch; got:\n{body_beta_after}"
+    );
+    assert!(
+        body_beta_after.contains("- https://example.test/pr/2 👈"),
+        "current marker must remain on `beta`'s PR URL line; got:\n{body_beta_after}"
+    );
+}
+
 /// Push a new commit onto `origin/main` without touching the local `main`
 /// branch in any existing worktree. We use a throwaway helper worktree on a
 /// scratch branch so the local trunk ref stays at its original tip and no

@@ -37,8 +37,21 @@ case "$sub" in
     if [ -f "$f" ]; then
       # shellcheck disable=SC1090
       . "$f"
-      printf '{"number":%s,"url":"https://example.test/pr/%s","baseRefName":"%s","state":"%s","title":"%s"}\n' \
-        "$NUM" "$NUM" "$BASE" "$STATE" "$TITLE"
+      # JSON-escape the stored body so multi-line bodies with quotes/newlines
+      # survive the round trip through `gh pr view --json body`. Bash-only.
+      esc_body='""'
+      if [ -f "$DIR/body_$branch" ]; then
+        esc_body=$(awk 'BEGIN{printf "\""} {
+          gsub(/\\/,"\\\\");
+          gsub(/"/,"\\\"");
+          gsub(/\r/,"\\r");
+          gsub(/\t/,"\\t");
+          if (NR>1) printf "\\n";
+          printf "%s", $0
+        } END{printf "\""}' "$DIR/body_$branch")
+      fi
+      printf '{"number":%s,"url":"https://example.test/pr/%s","baseRefName":"%s","state":"%s","title":"%s","body":%s}\n' \
+        "$NUM" "$NUM" "$BASE" "$STATE" "$TITLE" "$esc_body"
       exit 0
     fi
     echo "no pull requests found for branch \"$branch\"" >&2
@@ -77,14 +90,18 @@ case "$sub" in
     num="${1:-}"
     shift 2>/dev/null || true
     base=""
+    body=""
+    have_body=0
     while [ $# -gt 0 ]; do
       case "$1" in
         --base) base="$2"; shift 2 ;;
+        --body) body="$2"; have_body=1; shift 2 ;;
         *)      shift ;;
       esac
     done
     for f in "$DIR"/pr_*; do
       [ -f "$f" ] || continue
+      branch="${f##*/pr_}"
       # shellcheck disable=SC1090
       ( . "$f"
         if [ "$NUM" = "$num" ]; then
@@ -94,6 +111,9 @@ case "$sub" in
             echo "STATE=$STATE"
             echo "TITLE=\"$TITLE\""
           } > "$f"
+          if [ "$have_body" = "1" ]; then
+            printf '%s' "$body" > "$DIR/body_$branch"
+          fi
         fi )
     done
     exit 0
