@@ -66,9 +66,24 @@ pub fn run() -> Result<()> {
         println!("nothing left to restack");
         return Ok(());
     }
-    let mut plan = rebase::plan(&survivors, &roots, "sync")?;
+    // Restrict the attempt set to branches that look cleanly rebaseable;
+    // skip stale ones up-front so an out-of-band rewrite on one side of the
+    // tree never pulls a conflict-prone branch into sync.
+    let current_for_selection = match &original {
+        Some(b) if survivors.get(b).is_some() => b.clone(),
+        _ => trunk.clone(),
+    };
+    let selection = rebase::select_branches_for_clean_restack(&survivors, &current_for_selection);
+    let mut plan = rebase::plan_clean(&survivors, &roots, "sync", &selection.clean)?;
     if plan.chains.is_empty() {
-        println!("the stack is already up to date");
+        print_outcome(
+            &rebase::BestEffortOutcome {
+                restacked: Vec::new(),
+                outdated: Vec::new(),
+            },
+            &selection,
+            &style,
+        );
         return Ok(());
     }
     plan.snapshot = rollback_snapshot;
@@ -76,13 +91,17 @@ pub fn run() -> Result<()> {
     // discard work already done on an earlier branch in the same chain.
     rebase::split_chains_per_branch(&survivors, &mut plan);
     let outcome = rebase::start_best_effort(&survivors, plan)?;
-    print_outcome(&outcome, &style);
+    print_outcome(&outcome, &selection, &style);
     Ok(())
 }
 
 /// Summarize a best-effort restack: which branches moved, which were left
-/// outdated and need manual attention.
-fn print_outcome(outcome: &rebase::BestEffortOutcome, style: &OutputStyle) {
+/// outdated or skipped and need manual attention.
+fn print_outcome(
+    outcome: &rebase::BestEffortOutcome,
+    selection: &rebase::CleanSelection,
+    style: &OutputStyle,
+) {
     if !outcome.restacked.is_empty() {
         println!(
             "restacked: {}",
@@ -94,6 +113,19 @@ fn print_outcome(outcome: &rebase::BestEffortOutcome, style: &OutputStyle) {
                 .join(" ")
         );
     }
+    if !selection.stale.is_empty() {
+        let names = selection
+            .stale
+            .iter()
+            .map(|b| style.branch(b).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "{} {} (run `gt restack` manually to retry)",
+            style.warning("skipped (stale):"),
+            names
+        );
+    }
     if !outcome.outdated.is_empty() {
         let names = outcome
             .outdated
@@ -102,12 +134,12 @@ fn print_outcome(outcome: &rebase::BestEffortOutcome, style: &OutputStyle) {
             .collect::<Vec<_>>()
             .join(" ");
         println!(
-            "{} {} (run `gt restack` to retry)",
+            "{} {} (conflicts; needs manual restack)",
             style.warning("outdated:"),
             names
         );
     }
-    if outcome.restacked.is_empty() && outcome.outdated.is_empty() {
+    if outcome.restacked.is_empty() && outcome.outdated.is_empty() && selection.stale.is_empty() {
         println!("the stack is already up to date");
     }
 }
