@@ -24,14 +24,117 @@ pub struct RestackPlan {
     pub snapshot: Vec<BranchSnapshot>,
 }
 
-/// Outcome of a best-effort restack (used by `gt sync`).
+/// Outcome of a best-effort restack (used by `gt sync` and `gt restack`).
 ///
-/// In sync mode, conflicts do not pause the operation; the offending chain is
-/// aborted cleanly and the branches in it (plus their downstream chains) are
-/// reported as outdated.
+/// In best-effort mode, conflicts do not pause the operation; the offending
+/// chain is aborted cleanly and the branches in it (plus their downstream
+/// chains) are reported as outdated.
 pub struct BestEffortOutcome {
     pub restacked: Vec<String>,
     pub outdated: Vec<String>,
+}
+
+/// Up-front partition of branches into "worth attempting" and "stale".
+///
+/// `gt sync` and `gt restack` use this to avoid pulling unrelated stale
+/// branches into the rebase. See [`select_branches_for_clean_restack`].
+pub struct CleanSelection {
+    /// Branches eligible to be attempted in this restack pass.
+    pub clean: HashSet<String>,
+    /// Branches deliberately skipped up-front: their recorded fork point is
+    /// no longer in their parent's history, so a clean rebase is unlikely.
+    /// Stable order, suitable for user-facing output.
+    pub stale: Vec<String>,
+}
+
+/// Partition tracked branches into a clean (attempt) set and a stale (skip)
+/// set, with the current branch and everything on its path from trunk always
+/// in the clean set.
+///
+/// Heuristic:
+/// * `current` (if tracked) and every branch on the path from trunk to
+///   `current` are always included — the user is actively working there and
+///   may legitimately want to absorb a rewrite, even if it conflicts.
+/// * Every other tracked branch is included only if its recorded
+///   `parent_branch_revision` is still an ancestor of its parent's current
+///   tip. That is the "parent advanced cleanly" case where `git rebase
+///   --onto parent.tip recorded-rev` has a straightforward upstream.
+/// * Tracked branches whose recorded fork point is NOT an ancestor of their
+///   parent's tip are stale: the parent was rewritten under them, so a
+///   replay is likely to conflict. They are reported separately and left
+///   untouched.
+pub fn select_branches_for_clean_restack(graph: &StackGraph, current: &str) -> CleanSelection {
+    // Path from trunk to current (inclusive). These branches are always
+    // attempted, regardless of whether their fork point looks fresh.
+    let on_path: HashSet<String> = if graph.get(current).is_some() {
+        graph.path_from_trunk(current).into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+
+    let mut clean: HashSet<String> = HashSet::new();
+    let mut stale_set: HashSet<String> = HashSet::new();
+
+    for name in graph.tracked() {
+        if on_path.contains(name) {
+            clean.insert(name.to_string());
+            continue;
+        }
+        if parent_revision_is_in_history(graph, name) {
+            clean.insert(name.to_string());
+        } else {
+            stale_set.insert(name.to_string());
+        }
+    }
+
+    // Always include the current branch itself if it is a tracked, non-trunk
+    // branch (covered by `on_path` above, but guard against an untracked
+    // current — in which case there's nothing to add).
+    if let Some(node) = graph.get(current) {
+        if !graph.is_trunk(current) && node.validation == Validation::Valid {
+            clean.insert(current.to_string());
+            stale_set.remove(current);
+        }
+    }
+
+    // Deterministic order for the user-facing list: lexical, matching the
+    // way other commands render branch names.
+    let mut stale: Vec<String> = stale_set.into_iter().collect();
+    stale.sort();
+    CleanSelection { clean, stale }
+}
+
+/// Whether `branch`'s recorded `parent_branch_revision` is reachable from its
+/// parent's current tip. A tracked-but-unrecorded fork point counts as stale.
+fn parent_revision_is_in_history(graph: &StackGraph, branch: &str) -> bool {
+    let Some(node) = graph.get(branch) else {
+        return false;
+    };
+    if node.validation != Validation::Valid {
+        return false;
+    }
+    let parent = match node.parent.as_deref() {
+        Some(p) => p,
+        None => return false,
+    };
+    let recorded = match node
+        .meta
+        .as_ref()
+        .and_then(|m| m.parent_branch_revision.as_deref())
+    {
+        Some(r) => r,
+        None => return false,
+    };
+    let parent_tip = match graph.get(parent) {
+        Some(p) => p.tip.as_str(),
+        None => return false,
+    };
+    // The simplest case: the parent hasn't moved at all since this branch
+    // was stacked. No need to spawn git.
+    if recorded == parent_tip {
+        return true;
+    }
+    git::is_ancestor(recorded, parent_tip).unwrap_or(false)
 }
 
 /// Split each chain into one chain per branch.
@@ -73,6 +176,28 @@ pub fn split_chains_per_branch(graph: &StackGraph, plan: &mut RestackPlan) {
 
 /// Plan a restack of the subtrees rooted at `roots`.
 pub fn plan(graph: &StackGraph, roots: &[String], operation: &str) -> Result<RestackPlan> {
+    plan_inner(graph, roots, operation, None)
+}
+
+/// Plan a restack of the subtrees rooted at `roots`, but only include
+/// branches in `allow_set`. Branches outside the set are not added to any
+/// chain — even if their parent is being rebased. Used by best-effort
+/// callers (sync, restack) to skip stale branches up-front.
+pub fn plan_clean(
+    graph: &StackGraph,
+    roots: &[String],
+    operation: &str,
+    allow_set: &HashSet<String>,
+) -> Result<RestackPlan> {
+    plan_inner(graph, roots, operation, Some(allow_set))
+}
+
+fn plan_inner(
+    graph: &StackGraph,
+    roots: &[String],
+    operation: &str,
+    allow_set: Option<&HashSet<String>>,
+) -> Result<RestackPlan> {
     // Scope: every branch at or below a root (the trunk never moves).
     let mut scope: BTreeSet<String> = BTreeSet::new();
     for r in roots {
@@ -87,13 +212,19 @@ pub fn plan(graph: &StackGraph, roots: &[String], operation: &str) -> Result<Res
     ordered.sort_by_key(|b| graph.path_from_trunk(b).len());
 
     // A branch is rebased if its own fork point is stale, or an ancestor in
-    // scope is being rebased (its tip is about to move).
+    // scope is being rebased (its tip is about to move). With an allow-set,
+    // a branch is only considered if it appears in the set.
     let mut to_rebase: HashSet<String> = HashSet::new();
     let mut heads_order: Vec<String> = Vec::new();
     for b in &ordered {
         let Some(node) = graph.get(b) else { continue };
         if node.validation != Validation::Valid {
             continue;
+        }
+        if let Some(allow) = allow_set {
+            if !allow.contains(b) {
+                continue;
+            }
         }
         let parent = node.parent.clone().unwrap();
         if graph.needs_restack(b) || to_rebase.contains(&parent) {

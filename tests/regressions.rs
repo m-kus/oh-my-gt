@@ -1037,3 +1037,191 @@ fn sync_marks_unrestackable_branches_outdated_without_leaving_rebase_in_progress
         "sync must leave a clean working tree even when some branches are outdated"
     );
 }
+
+#[test]
+fn restack_skips_stale_branches_off_the_current_path() {
+    // Stack: main -> a -> b -> c, with `b`'s recorded parent_branch_revision
+    // rewritten so that the recorded fork point is no longer in `a`'s
+    // history (simulating an out-of-band rebase under `b`). The user is on
+    // `a`, and `gt restack` runs after main has advanced locally.
+    //
+    // Expected behavior:
+    //   * `a` restacks cleanly onto the new main.
+    //   * `b` is reported as skipped (stale) up-front and its tip is
+    //     untouched.
+    //   * `c` is not pulled into the rebase — its parent (b) did not move,
+    //     so there is nothing to do for it; its tip is untouched too.
+    //   * The repository ends in a clean state with no rebase-in-progress.
+    let repo = TestRepo::new("restack-skip-stale");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+
+    repo.create_with_gt("a feature", "a", "a.txt", "a\n");
+    repo.create_with_gt("b feature", "b", "b.txt", "b\n");
+    repo.create_with_gt("c feature", "c", "c.txt", "c\n");
+    let b_tip_before = repo.git(&["rev-parse", "b"]);
+    let c_tip_before = repo.git(&["rev-parse", "c"]);
+
+    // Rewrite b's recorded fork point to a SHA that is NOT in a's history:
+    // the root commit's tree under a fresh commit. That commit is detached
+    // from any branch and is guaranteed unreachable from a. We construct it
+    // by committing on a throwaway branch, copying its SHA, and discarding
+    // the branch.
+    repo.git(&["switch", "-q", "-c", "scratch", "main"]);
+    repo.write("scratch.txt", "scratch\n");
+    repo.git(&["add", "scratch.txt"]);
+    repo.git(&["commit", "-q", "-m", "scratch"]);
+    let orphan = repo.git(&["rev-parse", "HEAD"]);
+    repo.git(&["switch", "-q", "main"]);
+    repo.git(&["branch", "-D", "-q", "scratch"]);
+    repo.write_metadata("b", "a", &orphan);
+
+    // Advance main locally so `a` genuinely needs a restack.
+    repo.git(&["switch", "-q", "main"]);
+    repo.write("upstream.txt", "upstream\n");
+    repo.commit("upstream commit");
+    let new_main = repo.git(&["rev-parse", "main"]);
+
+    repo.git(&["switch", "-q", "a"]);
+    let out = repo.gt("restack", "");
+
+    assert_success(&out, "gt restack");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("restacked: a"),
+        "gt restack should report `a` as restacked; got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("skipped (stale):") && stdout.contains(" b"),
+        "gt restack should report `b` as skipped (stale); got stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("outdated:"),
+        "gt restack should not run `b` and report it outdated; got stdout:\n{stdout}"
+    );
+
+    // `a` was rebased onto the new trunk tip.
+    let a_parent = repo.git(&["rev-parse", "a^"]);
+    assert_eq!(
+        a_parent, new_main,
+        "a should now be parented on the advanced main"
+    );
+
+    // `b` and `c` were NOT touched.
+    assert_eq!(
+        repo.git(&["rev-parse", "b"]),
+        b_tip_before,
+        "b must be left at its pre-restack tip when its fork point is stale"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "c"]),
+        c_tip_before,
+        "c must be left untouched when its stale ancestor was skipped"
+    );
+
+    // No rebase-in-progress; conflict-resume state is cleared.
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "restack must not leave the repo in a rebase-in-progress state"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "restack must clear its state file even when some branches are skipped"
+    );
+
+    // Working tree is clean.
+    assert!(
+        repo.git(&["status", "--porcelain"]).is_empty(),
+        "restack must leave a clean working tree"
+    );
+}
+
+#[test]
+fn sync_skips_stale_upstream_branches_not_on_current_path() {
+    // Tree:
+    //   main
+    //     a   (current path leaf; the user is on `a`)
+    //     b   (off-path sibling whose recorded fork point is stale)
+    //
+    // Both `a` and `b` are direct children of main; `b` has had its recorded
+    // parent_branch_revision rewritten to a SHA outside main's history. The
+    // user is on `a`; origin/main advances. `gt sync` must:
+    //   * restack `a` cleanly onto the new main.
+    //   * NOT attempt `b` — it is off the current path and stale; report it
+    //     as skipped (stale).
+    //   * leave `b`'s tip untouched.
+    let repo = TestRepo::new("sync-skip-stale-off-path");
+    repo.add_origin();
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    // Create `a` off main (clean fork-point), then `b` as a sibling off main.
+    repo.create_with_gt("a feature", "a", "a.txt", "a\n");
+    repo.git(&["switch", "-q", "main"]);
+    repo.create_with_gt("b feature", "b", "b.txt", "b\n");
+    let b_tip_before = repo.git(&["rev-parse", "b"]);
+
+    // Cook an orphan commit, then rewrite b's parent_branch_revision to
+    // point at it. The orphan is unreachable from main, so b looks stale.
+    repo.git(&["switch", "-q", "-c", "scratch", "main"]);
+    repo.write("scratch.txt", "scratch\n");
+    repo.git(&["add", "scratch.txt"]);
+    repo.git(&["commit", "-q", "-m", "scratch"]);
+    let orphan = repo.git(&["rev-parse", "HEAD"]);
+    repo.git(&["switch", "-q", "main"]);
+    repo.git(&["branch", "-D", "-q", "scratch"]);
+    repo.write_metadata("b", "main", &orphan);
+
+    // Advance origin/main with an unrelated commit.
+    advance_origin_main(&repo, "upstream commit", "upstream.txt", "upstream\n");
+
+    repo.git(&["switch", "-q", "a"]);
+    let out = repo.gt("sync", "");
+
+    assert_success(&out, "gt sync");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("restacked: a"),
+        "sync should report `a` as restacked; got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("skipped (stale):") && stdout.contains(" b"),
+        "sync should report `b` as skipped (stale); got stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("outdated:"),
+        "sync must not attempt `b` and report it outdated; got stdout:\n{stdout}"
+    );
+
+    // `b`'s tip is exactly what it was before sync.
+    assert_eq!(
+        repo.git(&["rev-parse", "b"]),
+        b_tip_before,
+        "off-path stale branches must not be touched by sync"
+    );
+
+    // `a` was rebased onto the new trunk.
+    let new_main = repo.git(&["rev-parse", "main"]);
+    assert_eq!(
+        repo.git(&["rev-parse", "a^"]),
+        new_main,
+        "a should now be parented on the advanced main"
+    );
+
+    // No rebase-in-progress; state file cleared; working tree clean.
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "sync must not leave the repo in a rebase-in-progress state"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "sync must clear its state file even when some branches are skipped"
+    );
+    assert!(
+        repo.git(&["status", "--porcelain"]).is_empty(),
+        "sync must leave a clean working tree"
+    );
+}
