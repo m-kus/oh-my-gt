@@ -36,6 +36,21 @@ pub fn run() -> Result<()> {
         );
     }
 
+    // Capture submitted descendants before the amend: the restack will move
+    // their local tips past whatever the remote PR branch currently points at.
+    let submitted_descendants: Vec<String> = graph
+        .descendants(&current)
+        .into_iter()
+        .filter(|b| {
+            graph
+                .get(b)
+                .and_then(|n| n.meta.as_ref())
+                .and_then(|m| m.pr_info.as_ref())
+                .and_then(|p| p.number)
+                .is_some()
+        })
+        .collect();
+
     if git::run_interactive(&["commit", "--amend", "--no-edit"])? != 0 {
         return Err(GtError::Git("`git commit --amend` failed".into()));
     }
@@ -43,5 +58,21 @@ pub fn run() -> Result<()> {
     println!("{} `{}`", style.success("amended"), style.branch(&current),);
 
     // The amend moved this branch's tip, so every descendant must restack.
-    rebase::restack(std::slice::from_ref(&current), "modify")
+    rebase::restack(std::slice::from_ref(&current), "modify")?;
+
+    // After a clean restack, any descendant whose PR was already submitted
+    // now has a local tip ahead of its remote PR branch. Nudge the user, but
+    // do not touch refs, metadata, or the working tree.
+    if !submitted_descendants.is_empty() {
+        let branches: Vec<String> = submitted_descendants
+            .iter()
+            .map(|b| style.branch(b).to_string())
+            .collect();
+        println!(
+            "{} re-submit affected PRs: {}",
+            style.status("hint:"),
+            branches.join(" ")
+        );
+    }
+    Ok(())
 }

@@ -167,6 +167,45 @@ impl TestRepo {
         ]);
     }
 
+    fn set_pr_number(&self, branch: &str, number: u64) {
+        // Splice a synthetic `prInfo` into the existing metadata blob so the
+        // branch looks "submitted" without going through `gt submit` (which
+        // would need a working remote + fake gh state).
+        let raw = self.git(&["cat-file", "-p", &format!("refs/branch-metadata/{branch}")]);
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert(
+            "prInfo".into(),
+            serde_json::json!({
+                "number": number,
+                "base": "main",
+                "url": format!("https://example.test/pr/{number}"),
+                "state": "OPEN"
+            }),
+        );
+        let new_json = serde_json::to_string(&value).unwrap();
+        let mut hash = self.cmd("git");
+        hash.args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = hash.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(new_json.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_success(&out, "git hash-object");
+        let blob = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        self.git(&[
+            "update-ref",
+            &format!("refs/branch-metadata/{branch}"),
+            &blob,
+        ]);
+    }
+
     fn metadata_parent(&self, branch: &str) -> String {
         let json = self.git(&["cat-file", "-p", &format!("refs/branch-metadata/{branch}")]);
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -591,5 +630,66 @@ fn up_with_multiple_children_prompts_with_deterministic_order() {
     assert!(
         beta_pos < gamma_pos,
         "children should be listed in sorted order; got stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn modify_prints_submit_hint_for_submitted_descendants() {
+    // main <- a <- b, with b marked as submitted (PR #42). Amending a moves
+    // its tip, so the restack rewrites b — and b's remote PR branch is now
+    // behind. The modify command must say so without changing anything else.
+    let repo = TestRepo::new("modify-hint-submitted-descendant");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("a feature", "a", "a.txt", "a\n");
+    repo.create_with_gt("b feature", "b", "b.txt", "b\n");
+    repo.set_pr_number("b", 42);
+
+    // Amend `a` with a fresh staged change.
+    repo.git(&["switch", "-q", "a"]);
+    repo.write("a.txt", "a\namended\n");
+    repo.git(&["add", "a.txt"]);
+    let out = repo.gt("modify", "");
+
+    assert_success(&out, "gt modify");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hint_line = stdout
+        .lines()
+        .find(|l| l.contains("hint: re-submit affected PRs:"))
+        .unwrap_or_else(|| {
+            panic!("expected re-submit hint after restacking submitted descendant; got stdout:\n{stdout}")
+        });
+    assert!(
+        hint_line.contains('b'),
+        "expected branch `b` to be named in the hint line; got: {hint_line}"
+    );
+    // Sanity: the metadata PR number must not have been touched.
+    let json = repo.git(&["cat-file", "-p", "refs/branch-metadata/b"]);
+    assert!(
+        json.contains("\"number\":42"),
+        "modify must not rewrite pr_info; metadata is:\n{json}"
+    );
+}
+
+#[test]
+fn modify_does_not_print_hint_without_submitted_descendants() {
+    // main <- a <- b with NO PR info anywhere. The modify hint is purely a
+    // re-submit nudge, so it must stay silent here.
+    let repo = TestRepo::new("modify-hint-no-pr");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("a feature", "a", "a.txt", "a\n");
+    repo.create_with_gt("b feature", "b", "b.txt", "b\n");
+
+    repo.git(&["switch", "-q", "a"]);
+    repo.write("a.txt", "a\namended\n");
+    repo.git(&["add", "a.txt"]);
+    let out = repo.gt("modify", "");
+
+    assert_success(&out, "gt modify");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("re-submit"),
+        "no descendants have PRs, so the hint must stay silent; got stdout:\n{stdout}"
     );
 }
