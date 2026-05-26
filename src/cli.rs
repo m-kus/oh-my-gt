@@ -16,6 +16,8 @@ stack:
   modify     amend the current branch and restack everything above it
   move       re-parent the current branch onto another branch
   restack    rebase the current stack so each branch sits on its parent
+  up         switch to a child of the current branch
+  down       switch to the parent of the current branch
 
 remote:
   submit     push the stack and create/update its pull requests
@@ -60,7 +62,16 @@ pub fn run() -> Result<()> {
     // While an operation is paused, only `continue`/`abort`/`log` are allowed.
     let needs_idle = matches!(
         cmd.as_str(),
-        "track" | "untrack" | "create" | "modify" | "submit" | "move" | "restack" | "sync"
+        "track"
+            | "untrack"
+            | "create"
+            | "modify"
+            | "submit"
+            | "move"
+            | "restack"
+            | "sync"
+            | "up"
+            | "down"
     );
     if needs_idle && crate::state::exists() {
         return Err(GtError::State(
@@ -81,6 +92,8 @@ pub fn run() -> Result<()> {
         "abort" => commands::abort::run(),
         "log" => commands::log::run(),
         "tree" => commands::tree::run(),
+        "up" => commands::up::run(),
+        "down" => commands::down::run(),
         other => Err(GtError::Usage(format!(
             "unknown command `{other}`\n\n{USAGE}"
         ))),

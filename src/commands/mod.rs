@@ -3,6 +3,7 @@
 pub mod abort;
 pub mod continue_;
 pub mod create;
+pub mod down;
 pub mod log;
 pub mod modify;
 pub mod move_;
@@ -12,3 +13,4 @@ pub mod sync;
 pub mod track;
 pub mod tree;
 pub mod untrack;
+pub mod up;
