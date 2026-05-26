@@ -4,6 +4,7 @@
 use std::io::{self, BufRead, Write};
 
 use crate::error::{GtError, Result};
+use crate::tree::TreeLine;
 
 fn read_line() -> Result<String> {
     let mut s = String::new();
@@ -44,6 +45,61 @@ pub fn input(prompt: &str, default: Option<&str>) -> Result<String> {
         }
     } else {
         Ok(ans)
+    }
+}
+
+/// Tree picker: prints `lines` as a stack tree and accepts a numeric choice
+/// or a typed branch name. Only `TreeLine`s with `selectable == true` are
+/// pickable; the rest render for shape only. Returns the chosen branch.
+pub fn select_tree(prompt: &str, lines: &[TreeLine], default_branch: &str) -> Result<String> {
+    let mut choices: Vec<&TreeLine> = lines.iter().filter(|l| l.selectable).collect();
+    if choices.is_empty() {
+        return Err(GtError::State("nothing to choose from".into()));
+    }
+    if choices.len() == 1 {
+        return Ok(choices.remove(0).branch.clone());
+    }
+    let default = choices
+        .iter()
+        .position(|l| l.branch == default_branch)
+        .unwrap_or(0);
+
+    // Render: numbered slots line up under the same column whether or not a
+    // row is pickable, so the tree shape stays legible.
+    let width = choices.len().to_string().len();
+    let blank = " ".repeat(width + 2); // "N) " worth of padding
+    println!("{prompt}");
+    let mut n = 0usize;
+    for line in lines {
+        if line.selectable {
+            let marker = if n == default { ">" } else { " " };
+            let num = format!("{:>width$})", n + 1, width = width);
+            println!("  {marker} {num} {}", line.text);
+            n += 1;
+        } else {
+            println!("    {blank} {}", line.text);
+        }
+    }
+    loop {
+        print!(
+            "choose [1-{}, default {}, or branch name]: ",
+            choices.len(),
+            default + 1
+        );
+        io::stdout().flush()?;
+        let ans = read_line()?;
+        if ans.is_empty() {
+            return Ok(choices[default].branch.clone());
+        }
+        if let Ok(idx) = ans.parse::<usize>() {
+            if (1..=choices.len()).contains(&idx) {
+                return Ok(choices[idx - 1].branch.clone());
+            }
+        }
+        if let Some(c) = choices.iter().find(|l| l.branch == ans) {
+            return Ok(c.branch.clone());
+        }
+        println!("invalid choice");
     }
 }
 
