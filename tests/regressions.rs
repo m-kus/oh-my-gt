@@ -70,12 +70,42 @@ impl TestRepo {
     }
 
     fn cmd(&self, program: &str) -> Command {
+        self.cmd_in(program, &self.repo)
+    }
+
+    fn cmd_in(&self, program: &str, cwd: &Path) -> Command {
         let mut cmd = Command::new(program);
-        cmd.current_dir(&self.repo);
+        cmd.current_dir(cwd);
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
         cmd
+    }
+
+    fn git_in(&self, cwd: &Path, args: &[&str]) -> String {
+        let mut cmd = self.cmd_in("git", cwd);
+        cmd.args(args);
+        let out = cmd.output().unwrap();
+        assert_success(&out, &format!("git {} (in {:?})", args.join(" "), cwd));
+        String::from_utf8_lossy(&out.stdout)
+            .trim_end_matches('\n')
+            .to_string()
+    }
+
+    fn gt_in(&self, cwd: &Path, subcommand: &str, input: &str) -> Output {
+        let mut cmd = self.cmd_in(gt_bin().to_str().unwrap(), cwd);
+        cmd.arg(subcommand)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
     }
 
     fn git(&self, args: &[&str]) -> String {
@@ -742,6 +772,164 @@ fn submit_sends_empty_body_for_single_line_commit_message() {
     let body = fs::read_to_string(&body_path)
         .unwrap_or_else(|e| panic!("missing fake-gh body file {body_path:?}: {e}"));
     assert_eq!(body, "", "single-line commit must produce an empty PR body");
+}
+
+/// Push a new commit onto `origin/main` without touching the local `main`
+/// branch in any existing worktree. We use a throwaway helper worktree on a
+/// scratch branch so the local trunk ref stays at its original tip and no
+/// existing worktree is dirtied.
+fn advance_origin_main(repo: &TestRepo, message: &str, file: &str, content: &str) {
+    let upstream_dir = repo.root.join("upstream_helper");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "upstream-helper",
+        upstream_dir.to_str().unwrap(),
+        "main",
+    ]);
+    fs::write(upstream_dir.join(file), content).unwrap();
+    repo.git_in(&upstream_dir, &["add", file]);
+    repo.git_in(&upstream_dir, &["commit", "-q", "-m", message]);
+    repo.git_in(&upstream_dir, &["push", "-q", "origin", "HEAD:main"]);
+    repo.git(&["worktree", "remove", "-f", upstream_dir.to_str().unwrap()]);
+    repo.git(&["branch", "-D", "-q", "upstream-helper"]);
+}
+
+#[test]
+fn sync_fast_forwards_trunk_when_checked_out_in_other_worktree() {
+    // Set up: a primary worktree on `main`, a secondary feature worktree on
+    // `alpha`. Advance `origin/main` by one commit, then run `gt sync` from
+    // the feature worktree. The fast-forward must reach into the primary
+    // worktree without dirtying it, and the feature branch must restack on
+    // top of the new trunk tip.
+    let repo = TestRepo::new("sync-trunk-other-worktree");
+    repo.add_origin();
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    let original_main = repo.git(&["rev-parse", "HEAD"]);
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    // Build a feature branch via gt, then move it into its own worktree.
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    let feature_tip_before = repo.git(&["rev-parse", "HEAD"]);
+    let feature_dir = repo.root.join("alpha_wt");
+    // The feature branch is checked out in the primary worktree right now;
+    // move it out by switching primary back to main first.
+    repo.git(&["switch", "-q", "main"]);
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        feature_dir.to_str().unwrap(),
+        "alpha",
+    ]);
+
+    // Advance origin/main without touching local main.
+    advance_origin_main(&repo, "upstream commit", "upstream.txt", "upstream\n");
+
+    // Sanity: local main is still at the original tip in both worktrees.
+    assert_eq!(repo.git(&["rev-parse", "main"]), original_main);
+
+    // Run gt sync from the feature worktree.
+    let out = repo.gt_in(&feature_dir, "sync", "");
+    assert_success(&out, "gt sync from feature worktree");
+
+    // Trunk advanced (and both worktrees see the same ref).
+    let new_main = repo.git(&["rev-parse", "main"]);
+    assert_ne!(
+        new_main,
+        original_main,
+        "trunk should have fast-forwarded; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        repo.git_in(&feature_dir, &["rev-parse", "main"]),
+        new_main,
+        "the secondary worktree must observe the new trunk tip"
+    );
+    // The primary worktree (which had main checked out) must not be dirty.
+    assert!(
+        repo.git(&["status", "--porcelain"]).is_empty(),
+        "primary worktree must stay clean after a remote trunk fast-forward"
+    );
+    assert!(
+        repo.git_in(&feature_dir, &["status", "--porcelain"])
+            .is_empty(),
+        "feature worktree must stay clean after sync"
+    );
+
+    // The feature branch was restacked onto the new trunk: its commits now
+    // sit on top of the upstream commit, so it has a new tip.
+    let feature_tip_after = repo.git(&["rev-parse", "alpha"]);
+    assert_ne!(
+        feature_tip_after, feature_tip_before,
+        "alpha should have been restacked onto the advanced trunk"
+    );
+    // And the new trunk tip is an ancestor of alpha.
+    let merge_base = repo.git(&["merge-base", "alpha", "main"]);
+    assert_eq!(
+        merge_base, new_main,
+        "alpha must have been rebased on top of the new main"
+    );
+}
+
+#[test]
+fn sync_refuses_when_other_trunk_worktree_is_dirty() {
+    // Same setup as the happy path, but dirty the primary worktree (which
+    // owns `main`) before running sync. The command must refuse with a
+    // precondition error, and trunk must NOT advance — neither in the local
+    // ref nor in the worktrees.
+    let repo = TestRepo::new("sync-trunk-other-worktree-dirty");
+    repo.add_origin();
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    let original_main = repo.git(&["rev-parse", "HEAD"]);
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    let feature_dir = repo.root.join("alpha_wt");
+    repo.git(&["switch", "-q", "main"]);
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        feature_dir.to_str().unwrap(),
+        "alpha",
+    ]);
+
+    advance_origin_main(&repo, "upstream commit", "upstream.txt", "upstream\n");
+
+    // Dirty the primary worktree (it has main checked out).
+    repo.write("dirty.txt", "uncommitted\n");
+
+    let out = repo.gt_in(&feature_dir, "sync", "");
+    assert!(
+        !out.status.success(),
+        "gt sync must fail when the trunk worktree is dirty; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("uncommitted changes") && stderr.contains(repo.repo.to_str().unwrap()),
+        "expected a precondition error naming the dirty worktree; stderr:\n{stderr}"
+    );
+
+    // Trunk did NOT advance.
+    assert_eq!(
+        repo.git(&["rev-parse", "main"]),
+        original_main,
+        "trunk must not move when the owning worktree is dirty"
+    );
+    // And the uncommitted file is still where we left it.
+    assert_eq!(
+        fs::read_to_string(repo.repo.join("dirty.txt")).unwrap(),
+        "uncommitted\n",
+        "the dirty worktree must remain exactly as the user left it"
+    );
 }
 
 #[test]

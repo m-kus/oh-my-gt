@@ -258,3 +258,51 @@ pub fn conflicted_files() -> Result<Vec<String>> {
         .filter(|s| !s.is_empty())
         .collect())
 }
+
+/// Worktree that currently has `branch` checked out, if any.
+///
+/// Parses `git worktree list --porcelain`, which emits records of the form:
+///
+/// ```text
+/// worktree /abs/path
+/// HEAD <sha>
+/// branch refs/heads/<name>
+/// ```
+///
+/// separated by blank lines. The current process's worktree is included.
+pub fn worktree_owner_of(branch: &str) -> Result<Option<PathBuf>> {
+    let out = run(&["worktree", "list", "--porcelain"])?;
+    let wanted = head_ref(branch);
+    let mut current: Option<PathBuf> = None;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(rest));
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            if rest == wanted {
+                return Ok(current);
+            }
+        } else if line.is_empty() {
+            current = None;
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the working tree rooted at `worktree` is clean.
+pub fn is_clean_in(worktree: &Path) -> Result<bool> {
+    let path = worktree
+        .to_str()
+        .ok_or_else(|| GtError::Git(format!("non-UTF8 worktree path: {worktree:?}")))?;
+    let out = run(&["-C", path, "status", "--porcelain"])?;
+    Ok(out.is_empty())
+}
+
+/// Point a ref at a new SHA via `git update-ref`.
+///
+/// Callers must enforce the AGENTS.md data-safety rules — in particular, this
+/// must only be used to write `refs/heads/<trunk>` when trunk is not checked
+/// out in any worktree (so no working tree can be silently dirtied).
+pub fn update_ref(ref_name: &str, new_sha: &str) -> Result<()> {
+    run(&["update-ref", ref_name, new_sha])?;
+    Ok(())
+}
