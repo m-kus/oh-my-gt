@@ -14,6 +14,7 @@ use std::path::Path;
 use crate::error::{GtError, Result};
 use crate::graph::{StackGraph, Validation};
 use crate::state::{self, BranchSnapshot, Chain, OpState};
+use crate::style::OutputStyle;
 use crate::{git, meta};
 
 /// A planned restack: the chains to rebase and a rollback snapshot.
@@ -283,8 +284,13 @@ fn handle_rebase_exit(st: &mut OpState, git_dir: &Path) -> Result<()> {
     }
     state::save(st)?; // current_chain still points at the failing chain
     let chain = &st.chains[st.current_chain];
+    let style = OutputStyle::stdout();
     println!();
-    println!("\x1b[33mCONFLICT\x1b[0m while restacking `{}`", chain.tip());
+    println!(
+        "{} while restacking `{}`",
+        style.warning("CONFLICT"),
+        chain.tip()
+    );
     let files = git::conflicted_files().unwrap_or_default();
     if !files.is_empty() {
         println!("conflicted files:");

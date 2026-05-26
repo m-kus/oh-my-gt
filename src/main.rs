@@ -14,9 +14,11 @@ mod migrate;
 mod prompt;
 mod rebase;
 mod state;
+mod style;
 mod trunk;
 
 use error::GtError;
+use style::OutputStyle;
 
 use std::process::ExitCode;
 
@@ -30,7 +32,8 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Err(e) => {
-            eprintln!("\x1b[31merror:\x1b[0m {e}");
+            let style = OutputStyle::stderr();
+            eprintln!("{} {e}", style.error("error:"));
             ExitCode::FAILURE
         }
     }

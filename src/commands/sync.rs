@@ -5,16 +5,21 @@ use std::collections::HashSet;
 
 use crate::error::Result;
 use crate::graph::StackGraph;
+use crate::style::OutputStyle;
 use crate::{gh, git, meta, prompt, rebase};
 
 pub fn run() -> Result<()> {
     git::ensure_remote()?;
     let original = git::current_branch()?;
+    let style = OutputStyle::stdout();
 
-    println!("fetching...");
+    println!("{}", style.status("fetching..."));
     let fetched = git::run_allow_fail(&["fetch", "--prune"])?;
     if fetched.code != 0 {
-        println!("warning: `git fetch` failed; continuing with local state");
+        println!(
+            "{} `git fetch` failed; continuing with local state",
+            style.warning("warning:")
+        );
     }
 
     let trunk = StackGraph::load()?.trunk;
@@ -73,6 +78,7 @@ pub fn run() -> Result<()> {
 /// Fast-forward the trunk branch to its remote tip, if possible.
 fn fast_forward_trunk(trunk: &str) -> Result<()> {
     let remote_ref = format!("refs/remotes/origin/{trunk}");
+    let style = OutputStyle::stdout();
     if git::rev_parse_opt(&remote_ref)?.is_none() {
         println!("no `{remote_ref}`; skipping trunk update");
         return Ok(());
@@ -83,7 +89,10 @@ fn fast_forward_trunk(trunk: &str) -> Result<()> {
     if res.code == 0 {
         println!("updated `{trunk}`");
     } else {
-        println!("warning: `{trunk}` could not be fast-forwarded (it diverged from {remote_ref})");
+        println!(
+            "{} `{trunk}` could not be fast-forwarded (it diverged from {remote_ref})",
+            style.warning("warning:")
+        );
     }
     if let Some(b) = before {
         if b != trunk {

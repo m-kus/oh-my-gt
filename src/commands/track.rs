@@ -2,6 +2,7 @@
 
 use crate::error::{GtError, Result};
 use crate::graph::{StackGraph, Validation};
+use crate::style::OutputStyle;
 use crate::{git, meta, prompt};
 
 pub fn run() -> Result<()> {
@@ -35,7 +36,13 @@ pub fn run() -> Result<()> {
     m.parent_branch_revision = Some(base);
     meta::write(&current, &m)?;
 
-    println!("tracked `{current}` onto `{parent}`");
+    let style = OutputStyle::stdout();
+    println!(
+        "{} `{}` onto `{}`",
+        style.success("tracked"),
+        style.branch(&current),
+        style.branch(&parent),
+    );
     Ok(())
 }
 

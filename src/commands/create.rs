@@ -4,6 +4,7 @@
 use crate::error::{GtError, Result};
 use crate::graph::{StackGraph, Validation};
 use crate::meta::BranchMetadata;
+use crate::style::OutputStyle;
 use crate::{git, meta, prompt};
 
 pub fn run() -> Result<()> {
@@ -42,7 +43,13 @@ pub fn run() -> Result<()> {
     git::run(&["commit", "-m", &message])?;
 
     meta::write(&name, &BranchMetadata::new(&parent, &parent_tip))?;
-    println!("created `{name}` on `{parent}`");
+    let style = OutputStyle::stdout();
+    println!(
+        "{} `{}` on `{}`",
+        style.success("created"),
+        style.branch(&name),
+        style.branch(&parent),
+    );
     Ok(())
 }
 
