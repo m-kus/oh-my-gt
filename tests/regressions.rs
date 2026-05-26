@@ -954,3 +954,86 @@ fn modify_does_not_print_hint_without_submitted_descendants() {
         "no descendants have PRs, so the hint must stay silent; got stdout:\n{stdout}"
     );
 }
+
+#[test]
+fn sync_marks_unrestackable_branches_outdated_without_leaving_rebase_in_progress() {
+    // main <- a <- b. We amend `a` directly (bypassing `gt modify`, which
+    // would restack b eagerly), so b's recorded fork point now lags behind
+    // a's new tip and rebasing b's commit onto the amended a would conflict.
+    // Then we advance `origin/main` so sync has work to do. The expected
+    // behavior is:
+    //   * `a` is cleanly restacked onto the new main.
+    //   * `b` is left at its old tip and reported as outdated.
+    //   * The repo is NOT in a rebase-in-progress state at exit.
+    //   * The state.json conflict-resume file is cleared.
+    let repo = TestRepo::new("sync-partial-restack");
+    repo.add_origin();
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    // a touches shared.txt. b extends the same file — the line a touches.
+    repo.create_with_gt("a feature", "a", "shared.txt", "a1\n");
+    repo.create_with_gt("b feature", "b", "shared.txt", "a1\nb1\n");
+    let b_tip_before = repo.git(&["rev-parse", "b"]);
+
+    // Amend `a` directly so b's parent_branch_revision metadata is now stale
+    // and b's commit (which rewrites shared.txt to "a1\nb1") will conflict
+    // against an a-tip that says "A_AMENDED".
+    repo.git(&["switch", "-q", "a"]);
+    repo.write("shared.txt", "A_AMENDED\n");
+    repo.git(&["add", "shared.txt"]);
+    repo.git(&["commit", "--amend", "--no-edit", "-q"]);
+
+    // Advance origin/main with a non-conflicting commit; rewinding local main
+    // is not necessary because the helper pushes via a side worktree and
+    // local main is left at the original tip.
+    advance_origin_main(&repo, "upstream commit", "upstream.txt", "upstream\n");
+
+    repo.git(&["switch", "-q", "b"]);
+    let out = repo.gt("sync", "");
+
+    assert_success(&out, "gt sync");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("restacked: a"),
+        "sync should report `a` as restacked; got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("outdated:") && stdout.contains(" b "),
+        "sync should report `b` as outdated; got stdout:\n{stdout}"
+    );
+
+    // No rebase-in-progress directory remains.
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "sync must not leave the repo in a rebase-in-progress state"
+    );
+    // And the conflict-resume state file is not left dangling.
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "sync must clear its state file even when some branches are outdated"
+    );
+
+    // `a` was rebased onto the new trunk tip.
+    let new_main = repo.git(&["rev-parse", "main"]);
+    let a_parent = repo.git(&["rev-parse", "a^"]);
+    assert_eq!(
+        a_parent, new_main,
+        "a should now be parented on the advanced main"
+    );
+
+    // `b` was NOT rewritten; its tip is exactly what it was pre-sync.
+    let b_tip_after = repo.git(&["rev-parse", "b"]);
+    assert_eq!(
+        b_tip_after, b_tip_before,
+        "b must be left untouched when its restack cannot be applied cleanly"
+    );
+
+    // Working tree is clean; status is empty.
+    assert!(
+        repo.git(&["status", "--porcelain"]).is_empty(),
+        "sync must leave a clean working tree even when some branches are outdated"
+    );
+}
