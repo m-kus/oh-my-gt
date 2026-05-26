@@ -29,7 +29,7 @@ pub fn run() -> Result<()> {
 
     let message = prompt::input("commit message", None)?;
     let default_name = slugify(&message);
-    let name = prompt::input("branch name", Some(&default_name))?;
+    let name = prompt::input_branch_name("branch name", Some(&default_name))?;
 
     if git::branch_exists(&name)? {
         return Err(GtError::Usage(format!("branch `{name}` already exists")));
