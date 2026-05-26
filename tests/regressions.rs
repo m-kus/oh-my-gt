@@ -516,6 +516,52 @@ fn up_from_leaf_branch_errors_with_no_children() {
 }
 
 #[test]
+fn create_preserves_branch_name_and_rejects_whitespace_inputs() {
+    // Issue #12: branch-name input must be preserved verbatim, never silently
+    // trimmed. Surrounding whitespace is an explicit, recoverable error
+    // (because git itself would reject it), and the default still flows
+    // through when the user just presses Enter.
+    let repo = TestRepo::new("branch-name-no-trim");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+
+    // 1) Typed input with surrounding whitespace must NOT be silently
+    //    stripped — it must produce a clear error and leave nothing behind.
+    repo.write("alpha.txt", "alpha\n");
+    repo.git(&["add", "alpha.txt"]);
+    let out = repo.gt("create", "alpha feature\n  bad-name  \n");
+    assert!(
+        !out.status.success(),
+        "create should reject whitespace-padded branch names; got stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid character"),
+        "expected explicit rejection of whitespace; stderr:\n{stderr}"
+    );
+    assert!(
+        !repo.local_branch_exists("bad-name"),
+        "rejected name must not have been silently trimmed into a real branch"
+    );
+
+    // 2) An exact, valid name is preserved character-for-character.
+    let out = repo.gt("create", "alpha feature\nalpha\n");
+    assert_success(&out, "gt create with explicit name");
+    assert_eq!(repo.current_branch(), "alpha");
+
+    // 3) Pressing Enter on the branch-name prompt falls back to the slugged
+    //    default (the existing behavior we must not break).
+    repo.git(&["switch", "-q", "main"]);
+    repo.write("beta.txt", "beta\n");
+    repo.git(&["add", "beta.txt"]);
+    let out = repo.gt("create", "beta feature\n\n");
+    assert_success(&out, "gt create with default branch name");
+    assert_eq!(repo.current_branch(), "beta-feature");
+}
+
+#[test]
 fn up_with_multiple_children_prompts_with_deterministic_order() {
     // main <- alpha <- (beta, gamma). From alpha, `gt up` should show a
     // numbered prompt listing both children in sorted order, and pick the
