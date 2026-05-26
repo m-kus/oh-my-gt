@@ -13,11 +13,12 @@ use crate::style::OutputStyle;
 /// want to display the tree shape but map each entry back to a branch name.
 #[derive(Debug, Clone)]
 pub(crate) struct TreeLine {
-    // Read by `gt move`'s future picker (issue #4) and by the unit tests
-    // here; the binary build of `gt log`/`gt tree` only renders `text`.
-    #[allow(dead_code)]
     pub(crate) branch: String,
     pub(crate) text: String,
+    /// `true` when this line should be a numbered, pickable entry. Branches
+    /// outside the picker's `included` set still appear in the tree (so the
+    /// shape is preserved) but cannot be chosen.
+    pub(crate) selectable: bool,
 }
 
 /// Print the detailed tree (used by `gt log`): glyph, branch name, short
@@ -31,10 +32,10 @@ pub(crate) fn print_tree(graph: &StackGraph) {
     print_with_format(graph, LineFormat::TreeOnly);
 }
 
-/// Tree of branch names for picker prompts. `included` filters which
-/// branches participate in the tree; the depth and ordering match the
-/// printed views so the prompt mirrors what the user sees in `gt tree`.
-#[allow(dead_code)] // wired by a future `gt move` change (issue #4)
+/// Tree of branch names for picker prompts. Every tracked branch (trunk +
+/// `Valid`) is rendered so the picker preserves the stack shape; `included`
+/// flags which branches the caller will accept as a choice — branches
+/// outside the set are still displayed but marked unselectable.
 pub(crate) fn branch_lines(graph: &StackGraph, included: &HashSet<String>) -> Vec<TreeLine> {
     let style = OutputStyle::stdout();
     let mut out = Vec::new();
@@ -129,12 +130,15 @@ fn render_node(
     out: &mut Vec<TreeLine>,
 ) {
     let node = &graph.nodes[name];
-    if included.map(|set| set.contains(name)).unwrap_or(true) {
-        out.push(TreeLine {
-            branch: name.to_string(),
-            text: format_line(graph, name, depth, format, style),
-        });
-    }
+    // In `BranchOnly` mode every node renders (so the shape is preserved),
+    // but `included` flags which lines the picker treats as choices. Other
+    // formats ignore `included` entirely.
+    let selectable = included.map(|set| set.contains(name)).unwrap_or(true);
+    out.push(TreeLine {
+        branch: name.to_string(),
+        text: format_line(graph, name, depth, format, selectable, style),
+        selectable,
+    });
     // `children` is sorted in `StackGraph::link_children`, so iteration here
     // is deterministic across runs and matches the picker ordering.
     for child in &node.children {
@@ -147,6 +151,7 @@ fn format_line(
     name: &str,
     depth: usize,
     format: LineFormat,
+    selectable: bool,
     style: &OutputStyle,
 ) -> String {
     let node = &graph.nodes[name];
@@ -155,8 +160,14 @@ fn format_line(
 
     match format {
         LineFormat::BranchOnly => {
+            // Hollow circle for plain entries, filled for the checked-out
+            // branch — same glyph vocabulary as `gt tree`, so the picker
+            // mirrors what the user just saw.
+            let glyph = if is_current { "\u{25c9}" } else { "\u{25cb}" };
             let branch: Box<dyn std::fmt::Display> = if is_current {
                 Box::new(style.branch(name))
+            } else if !selectable {
+                Box::new(style.glyph(name))
             } else {
                 Box::new(name.to_string())
             };
@@ -165,11 +176,13 @@ fn format_line(
             } else {
                 String::new()
             };
-            format!("{indent}{branch}{marker}")
+            format!("{indent}{} {branch}{marker}", style.glyph(glyph))
         }
         LineFormat::TreeOnly | LineFormat::Detailed => {
             // Match charcoal's glyphs: filled circle for the current branch,
-            // hollow circle for the rest.
+            // hollow circle for the rest. `gt log`/`gt tree` ignore the
+            // `selectable` flag — every line they emit is informational.
+            let _ = selectable;
             let glyph = if is_current { "\u{25c9}" } else { "\u{25cb}" };
             let branch: Box<dyn std::fmt::Display> = if is_current {
                 Box::new(style.branch(name))

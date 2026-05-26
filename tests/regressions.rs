@@ -335,6 +335,87 @@ fn modify_warns_and_leaves_unstaged_changes_out_of_amend() {
 }
 
 #[test]
+fn move_prompt_shows_stack_tree_with_only_valid_parents_selectable() {
+    // Build a multi-branch stack:  main <- alpha <- (beta, gamma) , and
+    // create a child of beta so the picker has a non-selectable descendant
+    // to render for shape.
+    //
+    //   main
+    //     alpha
+    //       beta          (current)
+    //         delta       (descendant — must appear but not be pickable)
+    //       gamma
+    let repo = TestRepo::new("move-tree-picker");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    repo.create_with_gt("beta feature", "beta", "beta.txt", "beta\n");
+    repo.create_with_gt("delta feature", "delta", "delta.txt", "delta\n");
+    repo.git(&["switch", "-q", "alpha"]);
+    repo.create_with_gt("gamma feature", "gamma", "gamma.txt", "gamma\n");
+    repo.git(&["switch", "-q", "beta"]);
+
+    // Type the new parent by name so we don't depend on numeric ordering.
+    // Moving beta from alpha onto main exercises the picker *and* the
+    // rebase so we know the picker rewrite did not regress move's behavior.
+    let out = repo.gt("move", "main\n");
+    assert_success(&out, "gt move");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // The prompt header is followed by the rendered tree. Every tracked
+    // branch must appear (so the user sees the whole stack), but only the
+    // valid parent candidates (main, alpha, gamma) should be numbered.
+    assert!(
+        stdout.contains("move `beta` onto:"),
+        "missing prompt header in:\n{stdout}"
+    );
+    for branch in ["main", "alpha", "beta", "delta", "gamma"] {
+        assert!(
+            stdout.contains(branch),
+            "expected `{branch}` to appear in tree:\n{stdout}"
+        );
+    }
+
+    // Capture the numbered lines: format is `  > N) ...` or `    N) ...`.
+    let numbered: Vec<&str> = stdout
+        .lines()
+        .filter(|l| {
+            let s = l.trim_start();
+            s.starts_with("> ") || s.starts_with(|c: char| c.is_ascii_digit())
+        })
+        .filter(|l| l.contains(") "))
+        .collect();
+    let selectable: Vec<&str> = numbered
+        .iter()
+        .filter_map(|l| {
+            ["main", "alpha", "beta", "delta", "gamma"]
+                .iter()
+                .find(|b| l.contains(*b))
+                .copied()
+        })
+        .collect();
+    assert_eq!(
+        selectable,
+        vec!["main", "alpha", "gamma"],
+        "only valid parents should be numbered choices; got picker lines:\n{}",
+        numbered.join("\n")
+    );
+
+    // Trunk is the default when valid; the `>` marker sits on its line.
+    let default_line = stdout
+        .lines()
+        .find(|l| l.contains("> ") && l.contains("main"))
+        .unwrap_or_else(|| panic!("trunk should be the default choice; got:\n{stdout}"));
+    assert!(default_line.contains("1)"));
+
+    // And the rebase actually re-parented beta onto main (sanity check —
+    // the picker change must not affect the move logic).
+    assert_eq!(repo.metadata_parent("beta"), "main");
+    assert_eq!(repo.metadata_parent("delta"), "beta");
+}
+
+#[test]
 fn modify_errors_without_staged_changes_before_mutating() {
     let repo = TestRepo::new("modify-nothing-staged");
     repo.write("base.txt", "base\n");
