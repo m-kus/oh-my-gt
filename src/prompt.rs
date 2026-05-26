@@ -1,7 +1,7 @@
 //! Minimal interactive prompts read from stdin. Commands take no flags, so any
 //! input a command needs is gathered here.
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,17 +35,193 @@ fn read_line_preserving() -> Result<String> {
 }
 
 /// Ask a yes/no question; an empty answer takes `default`.
+///
+/// On an interactive TTY this resolves on a single `y`/`Y`/`n`/`N` keystroke
+/// without the user needing to press Enter. Enter alone takes the default;
+/// Ctrl-C (and EOF) aborts; any other key is ignored. When stdin is not a TTY
+/// (tests, the e2e harness, piped input), the prompt falls back to the
+/// historical line-based read so `printf 'y\n' | gt …` keeps working.
 pub fn confirm(question: &str, default: bool) -> Result<bool> {
     let hint = if default { "[Y/n]" } else { "[y/N]" };
     print!("{question} {hint} ");
     io::stdout().flush()?;
-    let ans = read_line()?.to_lowercase();
-    Ok(match ans.as_str() {
-        "" => default,
-        "y" | "yes" => true,
-        "n" | "no" => false,
-        _ => default,
-    })
+
+    // Non-interactive: keep the legacy line-based answer. Piped input from
+    // tests and the e2e harness must keep working unchanged.
+    if !io::stdin().is_terminal() {
+        let ans = read_line()?.to_lowercase();
+        return Ok(match ans.as_str() {
+            "" => default,
+            "y" | "yes" => true,
+            "n" | "no" => false,
+            _ => default,
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        confirm_single_key(default)
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-unix targets are not officially supported (the repo is
+        // POSIX-flavored). Preserve the line-based behavior just in case.
+        let ans = read_line()?.to_lowercase();
+        Ok(match ans.as_str() {
+            "" => default,
+            "y" | "yes" => true,
+            "n" | "no" => false,
+            _ => default,
+        })
+    }
+}
+
+/// One-keystroke resolution of a yes/no prompt; runs only when stdin is a TTY.
+///
+/// Implementation notes:
+///
+/// * Allowed crate dependencies are `serde` / `serde_json` only — no `libc`,
+///   so termios is driven by shelling out to POSIX `stty`. AGENTS.md routes
+///   `git` and `gh` through their respective single chokepoints; `stty` is
+///   the documented exception and is spawned directly from this module.
+/// * `stty -g` prints a portable encoding of the current terminal mode; we
+///   stash it on the [`TermiosGuard`] and `stty <encoding>` restores it on
+///   every exit path (normal return, error, panic unwind). Both `stty` calls
+///   inherit stdin so they target the controlling terminal.
+/// * In raw mode the kernel does not translate `^C` into SIGINT; it just
+///   delivers the literal byte `0x03`. We treat `0x03` (and `0x04`, EOT) as
+///   [`GtError::Aborted`] to match the cooked-mode semantics.
+#[cfg(unix)]
+fn confirm_single_key(default: bool) -> Result<bool> {
+    // If we cannot set the terminal up for single-key reads, fall back to the
+    // line-based path so the prompt still works rather than failing outright.
+    let Some(_guard) = TermiosGuard::enable_raw() else {
+        let ans = read_line()?.to_lowercase();
+        return Ok(match ans.as_str() {
+            "" => default,
+            "y" | "yes" => true,
+            "n" | "no" => false,
+            _ => default,
+        });
+    };
+
+    let mut stdin = io::stdin().lock();
+    let mut buf = [0u8; 1];
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) => return Err(GtError::Aborted), // EOF
+            Ok(_) => {}
+            Err(_) => return Err(GtError::Aborted),
+        }
+        match decide(buf[0], default) {
+            KeyDecision::Yes => {
+                // Raw mode suppresses echo; print the resolution ourselves so
+                // the prompt visibly advances, mirroring Graphite's feel.
+                println!("y");
+                return Ok(true);
+            }
+            KeyDecision::No => {
+                println!("n");
+                return Ok(false);
+            }
+            KeyDecision::Default => {
+                println!("{}", if default { 'y' } else { 'n' });
+                return Ok(default);
+            }
+            KeyDecision::Abort => return Err(GtError::Aborted),
+            KeyDecision::Ignore => continue,
+        }
+    }
+}
+
+/// Decision a single byte from stdin maps to in single-key confirm mode.
+/// Split out so it can be unit-tested without involving a real terminal.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyDecision {
+    Yes,
+    No,
+    Default,
+    Abort,
+    Ignore,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn decide(byte: u8, _default: bool) -> KeyDecision {
+    match byte {
+        b'y' | b'Y' => KeyDecision::Yes,
+        b'n' | b'N' => KeyDecision::No,
+        b'\n' | b'\r' => KeyDecision::Default,
+        0x03 | 0x04 => KeyDecision::Abort, // Ctrl-C, Ctrl-D in raw mode
+        _ => KeyDecision::Ignore,
+    }
+}
+
+/// RAII helper that puts the terminal into raw mode and restores the prior
+/// mode on drop. Constructed only when stdin is a TTY; `enable_raw` returns
+/// `None` if `stty` is unavailable or fails so the caller can fall back to
+/// line-based reading.
+///
+/// We capture the original mode with `stty -g` (a portable encoding) before
+/// switching to raw mode, then feed that exact string back through `stty` on
+/// drop. Both invocations inherit stdin so they act on the controlling
+/// terminal without needing `-F /dev/tty`.
+#[cfg(unix)]
+struct TermiosGuard {
+    saved: String,
+}
+
+#[cfg(unix)]
+impl TermiosGuard {
+    fn enable_raw() -> Option<Self> {
+        let saved = stty_capture()?;
+        // `-icanon` disables line buffering, `-echo` suppresses echo, and
+        // `min 1 time 0` makes `read` return as soon as one byte is available.
+        if !stty_apply(&["-icanon", "-echo", "min", "1", "time", "0"]) {
+            // Best effort: try to restore the saved mode in case stty applied
+            // a partial change before failing.
+            let _ = stty_apply(&[saved.as_str()]);
+            return None;
+        }
+        Some(TermiosGuard { saved })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TermiosGuard {
+    fn drop(&mut self) {
+        // Best-effort restore: if this fails the user could be left in a
+        // weird state, but there is nothing meaningful we can do here.
+        let _ = stty_apply(&[self.saved.as_str()]);
+    }
+}
+
+// `stty` is the documented exception to the "all spawns through git.rs/gh.rs"
+// rule (see AGENTS.md / issue #29). The two helpers below are the only places
+// in the crate that run it. They inherit stdin so stty targets the controlling
+// terminal; stdout is captured for `-g` and silenced for apply.
+#[cfg(unix)]
+fn stty_capture() -> Option<String> {
+    let out = Command::new("stty").arg("-g").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let trimmed = s.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed)
+}
+
+#[cfg(unix)]
+fn stty_apply(args: &[&str]) -> bool {
+    Command::new("stty")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Free-text input; an empty answer takes `default` when one is given.
@@ -493,5 +669,55 @@ mod tests {
         // keyword answers like " y " keep working.
         let trimmed: String = read_preserving_from(b"   y   \n").trim().to_string();
         assert_eq!(trimmed, "y");
+    }
+
+    #[test]
+    fn decide_recognises_yes_keys() {
+        // Both cases map to Yes regardless of the default — a typed `y` is
+        // an explicit answer, not a hint.
+        assert_eq!(decide(b'y', true), KeyDecision::Yes);
+        assert_eq!(decide(b'y', false), KeyDecision::Yes);
+        assert_eq!(decide(b'Y', true), KeyDecision::Yes);
+        assert_eq!(decide(b'Y', false), KeyDecision::Yes);
+    }
+
+    #[test]
+    fn decide_recognises_no_keys() {
+        assert_eq!(decide(b'n', true), KeyDecision::No);
+        assert_eq!(decide(b'n', false), KeyDecision::No);
+        assert_eq!(decide(b'N', true), KeyDecision::No);
+        assert_eq!(decide(b'N', false), KeyDecision::No);
+    }
+
+    #[test]
+    fn decide_treats_enter_as_default() {
+        // Bare Enter (LF) and CR both pick the prompt's default; the caller
+        // resolves Default to the actual bool, so this branch only signals
+        // "user pressed Enter".
+        assert_eq!(decide(b'\n', true), KeyDecision::Default);
+        assert_eq!(decide(b'\n', false), KeyDecision::Default);
+        assert_eq!(decide(b'\r', true), KeyDecision::Default);
+        assert_eq!(decide(b'\r', false), KeyDecision::Default);
+    }
+
+    #[test]
+    fn decide_treats_ctrl_c_and_eot_as_abort() {
+        // In raw mode the kernel does not send SIGINT for ^C; we must treat
+        // the raw bytes as abort ourselves. Same for ^D (EOF).
+        assert_eq!(decide(0x03, true), KeyDecision::Abort);
+        assert_eq!(decide(0x03, false), KeyDecision::Abort);
+        assert_eq!(decide(0x04, true), KeyDecision::Abort);
+        assert_eq!(decide(0x04, false), KeyDecision::Abort);
+    }
+
+    #[test]
+    fn decide_ignores_irrelevant_keys() {
+        // Anything that is not yes/no/Enter/abort should be ignored — the
+        // caller loops until it sees a meaningful keystroke. Spot-check a
+        // handful of plausible accidental keys.
+        for byte in [b'a', b'q', b' ', b'\t', b'0', b'1', 0x1B /* ESC */] {
+            assert_eq!(decide(byte, true), KeyDecision::Ignore, "byte {byte:#x}");
+            assert_eq!(decide(byte, false), KeyDecision::Ignore, "byte {byte:#x}");
+        }
     }
 }
