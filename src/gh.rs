@@ -18,6 +18,10 @@ pub struct PrView {
     pub state: String,
     #[serde(default)]
     pub title: String,
+    /// Current PR body on GitHub. May contain a previously-rendered stack
+    /// overview section, plus any user edits made outside the markers.
+    #[serde(default)]
+    pub body: String,
 }
 
 fn spawn(args: &[&str]) -> Result<(i32, String, String)> {
@@ -49,7 +53,7 @@ pub fn view(branch: &str) -> Result<Option<PrView>> {
         "pr",
         "view",
         "--json",
-        "number,url,baseRefName,state,title",
+        "number,url,baseRefName,state,title,body",
         "--",
         branch,
     ])?;
@@ -84,6 +88,14 @@ pub fn create(head: &str, base: &str, title: &str, body: &str) -> Result<()> {
 pub fn set_base(number: u64, base: &str) -> Result<()> {
     checked(
         &["pr", "edit", &number.to_string(), "--base", base],
+        "pr edit",
+    )
+}
+
+/// Replace the body of an existing pull request.
+pub fn set_body(number: u64, body: &str) -> Result<()> {
+    checked(
+        &["pr", "edit", &number.to_string(), "--body", body],
         "pr edit",
     )
 }
