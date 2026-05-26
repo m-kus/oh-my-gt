@@ -72,7 +72,44 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     plan.snapshot = rollback_snapshot;
-    rebase::start(&survivors, plan)
+    // Sync uses per-branch chains so a conflict on one branch does not
+    // discard work already done on an earlier branch in the same chain.
+    rebase::split_chains_per_branch(&survivors, &mut plan);
+    let outcome = rebase::start_best_effort(&survivors, plan)?;
+    print_outcome(&outcome, &style);
+    Ok(())
+}
+
+/// Summarize a best-effort restack: which branches moved, which were left
+/// outdated and need manual attention.
+fn print_outcome(outcome: &rebase::BestEffortOutcome, style: &OutputStyle) {
+    if !outcome.restacked.is_empty() {
+        println!(
+            "restacked: {}",
+            outcome
+                .restacked
+                .iter()
+                .map(|b| style.branch(b).to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    if !outcome.outdated.is_empty() {
+        let names = outcome
+            .outdated
+            .iter()
+            .map(|b| style.branch(b).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "{} {} (run `gt restack` to retry)",
+            style.warning("outdated:"),
+            names
+        );
+    }
+    if outcome.restacked.is_empty() && outcome.outdated.is_empty() {
+        println!("the stack is already up to date");
+    }
 }
 
 /// Fast-forward the trunk branch to its remote tip, if possible.

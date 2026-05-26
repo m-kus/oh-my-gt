@@ -24,6 +24,53 @@ pub struct RestackPlan {
     pub snapshot: Vec<BranchSnapshot>,
 }
 
+/// Outcome of a best-effort restack (used by `gt sync`).
+///
+/// In sync mode, conflicts do not pause the operation; the offending chain is
+/// aborted cleanly and the branches in it (plus their downstream chains) are
+/// reported as outdated.
+pub struct BestEffortOutcome {
+    pub restacked: Vec<String>,
+    pub outdated: Vec<String>,
+}
+
+/// Split each chain into one chain per branch.
+///
+/// `gt sync` uses this so that a conflict on one branch leaves earlier
+/// branches in the same chain restacked cleanly. The trade-off — one `git
+/// rebase` invocation per branch instead of one per chain — is acceptable for
+/// sync (which is interactive and uncommon).
+pub fn split_chains_per_branch(graph: &StackGraph, plan: &mut RestackPlan) {
+    let mut out: Vec<Chain> = Vec::new();
+    for chain in plan.chains.drain(..) {
+        for (i, branch) in chain.branches.iter().enumerate() {
+            // For the first sub-chain, the parent and old_base match the
+            // original chain. For later sub-chains, the parent is the previous
+            // branch in the chain and the old_base is that branch's pre-rebase
+            // tip — which is exactly what the next branch's metadata records
+            // as its parent revision.
+            let (parent, old_base) = if i == 0 {
+                (chain.parent.clone(), chain.old_base.clone())
+            } else {
+                let prev = chain.branches[i - 1].clone();
+                let recorded = graph
+                    .get(branch)
+                    .and_then(|n| n.meta.as_ref())
+                    .and_then(|m| m.parent_branch_revision.clone())
+                    .expect("a chain branch is always tracked with a fork point");
+                (prev, recorded)
+            };
+            out.push(Chain {
+                parent,
+                old_base,
+                branches: vec![branch.clone()],
+                done: false,
+            });
+        }
+    }
+    plan.chains = out;
+}
+
 /// Plan a restack of the subtrees rooted at `roots`.
 pub fn plan(graph: &StackGraph, roots: &[String], operation: &str) -> Result<RestackPlan> {
     // Scope: every branch at or below a root (the trunk never moves).
@@ -148,6 +195,22 @@ pub fn restack(roots: &[String], operation: &str) -> Result<()> {
 
 /// Begin executing a freshly-built plan.
 pub fn start(graph: &StackGraph, plan: RestackPlan) -> Result<()> {
+    let st = prepare(graph, plan)?;
+    state::save(&st)?;
+    drive(st)
+}
+
+/// Like [`start`], but on conflicts the offending chain is cleanly aborted and
+/// reported as outdated rather than pausing the operation. Used by `gt sync`,
+/// which must never leave the repo in a rebase-in-progress state.
+pub fn start_best_effort(graph: &StackGraph, plan: RestackPlan) -> Result<BestEffortOutcome> {
+    let st = prepare(graph, plan)?;
+    state::save(&st)?;
+    drive_best_effort(st)
+}
+
+/// Common preflight for [`start`] and [`start_best_effort`].
+fn prepare(graph: &StackGraph, plan: RestackPlan) -> Result<OpState> {
     let current = graph.current.clone().ok_or_else(|| {
         GtError::Precondition("HEAD is detached; check out a branch first".into())
     })?;
@@ -157,8 +220,7 @@ pub fn start(graph: &StackGraph, plan: RestackPlan) -> Result<()> {
             "a git rebase is already in progress".into(),
         ));
     }
-
-    let st = OpState {
+    Ok(OpState {
         version: 1,
         operation: plan.operation,
         trunk: graph.trunk.clone(),
@@ -166,9 +228,7 @@ pub fn start(graph: &StackGraph, plan: RestackPlan) -> Result<()> {
         snapshot: plan.snapshot,
         chains: plan.chains,
         current_chain: 0,
-    };
-    state::save(&st)?;
-    drive(st)
+    })
 }
 
 /// Resume an operation paused on conflicts (`gt continue`).
@@ -224,6 +284,82 @@ pub fn abort() -> Result<()> {
 }
 
 // ── internals ───────────────────────────────────────────────────────────────
+
+/// Best-effort variant of [`drive`]: on conflict, abort the rebase, mark the
+/// chain (plus every downstream chain) as outdated, and continue.
+fn drive_best_effort(mut st: OpState) -> Result<BestEffortOutcome> {
+    let mut restacked: Vec<String> = Vec::new();
+    let mut outdated: HashSet<String> = HashSet::new();
+
+    while st.current_chain < st.chains.len() {
+        if st.chains[st.current_chain].done {
+            st.current_chain += 1;
+            continue;
+        }
+        // Skip chains whose parent was marked outdated — they cannot be cleanly
+        // restacked without first applying the upstream change.
+        if outdated.contains(&st.chains[st.current_chain].parent) {
+            for b in &st.chains[st.current_chain].branches {
+                outdated.insert(b.clone());
+            }
+            st.current_chain += 1;
+            continue;
+        }
+
+        let chain = st.chains[st.current_chain].clone();
+        let new_base = git::branch_tip(&chain.parent)?;
+        let code = git::run_interactive(&[
+            "rebase",
+            "--update-refs",
+            "--committer-date-is-author-date",
+            "--empty=drop",
+            "--onto",
+            &new_base,
+            &chain.old_base,
+            "--",
+            chain.tip(),
+        ])?;
+        if code != 0 {
+            let gd = git::git_dir()?;
+            if git::rebase_in_progress(&gd) {
+                // Cleanly abort: never leave the repo in a rebase-in-progress
+                // state from `gt sync`.
+                let _ = git::run(&["rebase", "--abort"]);
+            }
+            for b in &chain.branches {
+                outdated.insert(b.clone());
+            }
+            st.current_chain += 1;
+            state::save(&st)?;
+            continue;
+        }
+
+        finish_chain(&mut st)?;
+        for b in &chain.branches {
+            restacked.push(b.clone());
+        }
+    }
+
+    state::clear()?;
+    if let Some(rb) = &st.return_branch {
+        git::switch_if_exists(rb)?;
+    }
+
+    // Stable order: report outdated branches in the order they appear in the
+    // plan so the summary is deterministic for tests.
+    let mut outdated_list: Vec<String> = Vec::new();
+    for chain in &st.chains {
+        for b in &chain.branches {
+            if outdated.contains(b) && !outdated_list.contains(b) {
+                outdated_list.push(b.clone());
+            }
+        }
+    }
+    Ok(BestEffortOutcome {
+        restacked,
+        outdated: outdated_list,
+    })
+}
 
 /// Run chains from `current_chain` onward.
 fn drive(mut st: OpState) -> Result<()> {

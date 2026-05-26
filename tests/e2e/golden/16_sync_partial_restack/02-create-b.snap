@@ -1,0 +1,15 @@
+# step: create-b (exit=0)
+HEAD: b
+rebase: none
+status:
+branches:
+  a -> @a-feature tree=d1d05facfaf62836ec569a4244ae2f3445599c15
+  b -> @b-feature tree=0ba0a935e3de0096d83ae885835ee229c33f7ec4
+  main -> @root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0
+commits:
+@a-feature tree=d1d05facfaf62836ec569a4244ae2f3445599c15 parents=[@root-commit] a feature
+@b-feature tree=0ba0a935e3de0096d83ae885835ee229c33f7ec4 parents=[@a-feature] b feature
+@root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
+metadata:
+  a: {"parentBranchName":"main","parentBranchRevision":"@root-commit"}
+  b: {"parentBranchName":"a","parentBranchRevision":"@a-feature"}
