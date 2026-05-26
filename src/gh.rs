@@ -66,10 +66,15 @@ pub fn view(branch: &str) -> Result<Option<PrView>> {
 }
 
 /// Create a pull request for `head` against `base`.
+///
+/// New PRs are opened as drafts so a stacked-PR submitter can iterate on the
+/// stack before requesting review; publishing is a one-click action on GitHub.
+/// Update paths (`set_base`) intentionally leave draft state alone.
 pub fn create(head: &str, base: &str, title: &str, body: &str) -> Result<()> {
     checked(
         &[
-            "pr", "create", "--head", head, "--base", base, "--title", title, "--body", body,
+            "pr", "create", "--draft", "--head", head, "--base", base, "--title", title, "--body",
+            body,
         ],
         &format!("pr create for `{head}`"),
     )
