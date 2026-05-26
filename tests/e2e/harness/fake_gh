@@ -46,13 +46,13 @@ case "$sub" in
     ;;
 
   create)
-    head="" base="" title=""
+    head="" base="" title="" body=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --head)  head="$2";  shift 2 ;;
         --base)  base="$2";  shift 2 ;;
         --title) title="$2"; shift 2 ;;
-        --body)  shift 2 ;;
+        --body)  body="$2";  shift 2 ;;
         *)       shift ;;
       esac
     done
@@ -66,6 +66,9 @@ case "$sub" in
       echo "STATE=OPEN"
       echo "TITLE=\"$title\""
     } > "$DIR/pr_$head"
+    # Record the body separately so tests can assert on the exact bytes
+    # passed to `gh pr create` without disturbing the shell-sourced pr_* file.
+    printf '%s' "$body" > "$DIR/body_$head"
     echo "https://example.test/pr/$n"
     exit 0
     ;;

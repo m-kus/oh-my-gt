@@ -672,6 +672,79 @@ fn modify_prints_submit_hint_for_submitted_descendants() {
 }
 
 #[test]
+fn submit_preserves_full_multi_line_commit_message_in_new_pr() {
+    // A branch whose tip commit has a subject + blank line + multi-paragraph
+    // body must produce a PR with the subject as title and the *entire* body
+    // (blank lines, punctuation, every line) preserved verbatim. Regression
+    // for issue #9, where only the first line was being kept.
+    let repo = TestRepo::new("submit-multiline-body");
+    repo.add_origin();
+
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    let root = repo.git(&["rev-parse", "HEAD"]);
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    // Build a branch with a deliberately multi-line commit message — git
+    // accepts repeated `-m` flags as paragraphs separated by a blank line,
+    // so this mirrors the real-world editor flow without needing a TTY.
+    repo.git(&["switch", "-q", "-c", "alpha"]);
+    repo.write("alpha.txt", "alpha\n");
+    repo.git(&["add", "alpha.txt"]);
+    repo.git(&[
+        "commit",
+        "-q",
+        "-m",
+        "Add login flow",
+        "-m",
+        "This wires the new sign-in screen end-to-end.\n\n- handles 2FA\n- resolves #42!",
+    ]);
+    repo.write_metadata("alpha", "main", &root);
+
+    let out = repo.gt("submit", "");
+    assert_success(&out, "gt submit");
+
+    // The fake `gh` records the body bytes alongside the rest of the PR
+    // state, so we can assert on what `gh pr create --body` actually got.
+    let body_path = repo.root.join("ghstate/body_alpha");
+    let body = fs::read_to_string(&body_path)
+        .unwrap_or_else(|e| panic!("missing fake-gh body file {body_path:?}: {e}"));
+    assert_eq!(
+        body, "This wires the new sign-in screen end-to-end.\n\n- handles 2FA\n- resolves #42!",
+        "submit must forward the full commit body (blank lines + punctuation) to gh pr create",
+    );
+
+    // And the title is just the subject — GitHub only accepts a single line.
+    let pr_path = repo.root.join("ghstate/pr_alpha");
+    let pr_state = fs::read_to_string(&pr_path).unwrap();
+    assert!(
+        pr_state.contains("TITLE=\"Add login flow\""),
+        "submit must use the first line as the PR title; got pr state:\n{pr_state}"
+    );
+}
+
+#[test]
+fn submit_sends_empty_body_for_single_line_commit_message() {
+    // A one-line commit must continue to produce an empty PR body — the
+    // historical contract this issue must not regress.
+    let repo = TestRepo::new("submit-single-line-body");
+    repo.add_origin();
+
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+
+    let out = repo.gt("submit", "");
+    assert_success(&out, "gt submit");
+
+    let body_path = repo.root.join("ghstate/body_alpha");
+    let body = fs::read_to_string(&body_path)
+        .unwrap_or_else(|e| panic!("missing fake-gh body file {body_path:?}: {e}"));
+    assert_eq!(body, "", "single-line commit must produce an empty PR body");
+}
+
+#[test]
 fn modify_does_not_print_hint_without_submitted_descendants() {
     // main <- a <- b with NO PR info anywhere. The modify hint is purely a
     // re-submit nudge, so it must stay silent here.
