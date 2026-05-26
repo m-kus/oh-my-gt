@@ -187,6 +187,10 @@ impl TestRepo {
     fn head(&self) -> String {
         self.git(&["rev-parse", "HEAD"])
     }
+
+    fn current_branch(&self) -> String {
+        self.git(&["symbolic-ref", "--short", "HEAD"])
+    }
 }
 
 impl Drop for TestRepo {
@@ -434,4 +438,112 @@ fn modify_errors_without_staged_changes_before_mutating() {
     assert!(stderr.contains("no staged changes; stage something with `git add` first"));
     assert_eq!(repo.head(), before);
     assert_eq!(repo.git(&["show", "HEAD:alpha.txt"]), "alpha");
+}
+
+#[test]
+fn down_switches_from_feature_to_parent_including_trunk() {
+    // main <- alpha <- beta. `gt down` from beta lands on alpha, and a
+    // second `gt down` lands on trunk.
+    let repo = TestRepo::new("down-walks-to-trunk");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    repo.create_with_gt("beta feature", "beta", "beta.txt", "beta\n");
+    assert_eq!(repo.current_branch(), "beta");
+
+    let out = repo.gt("down", "");
+    assert_success(&out, "gt down (beta -> alpha)");
+    assert_eq!(repo.current_branch(), "alpha");
+
+    let out = repo.gt("down", "");
+    assert_success(&out, "gt down (alpha -> main)");
+    assert_eq!(repo.current_branch(), "main");
+
+    // Trunk has no parent; the next `gt down` must refuse cleanly.
+    let out = repo.gt("down", "");
+    assert!(
+        !out.status.success(),
+        "gt down on trunk should fail with a precondition error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("trunk"),
+        "expected trunk precondition error; got stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn up_with_single_child_switches_silently() {
+    // main <- alpha <- beta. From alpha, `gt up` has exactly one valid
+    // child (beta) and must switch without prompting.
+    let repo = TestRepo::new("up-single-child");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    repo.create_with_gt("beta feature", "beta", "beta.txt", "beta\n");
+    repo.git(&["switch", "-q", "alpha"]);
+
+    let out = repo.gt("up", "");
+    assert_success(&out, "gt up (alpha -> beta)");
+    assert_eq!(repo.current_branch(), "beta");
+    // A single-child `up` should not print a numbered chooser.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("choose ["),
+        "single-child `gt up` should not prompt; got stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn up_from_leaf_branch_errors_with_no_children() {
+    // main <- alpha. `gt up` from leaf alpha must fail cleanly without
+    // switching anywhere.
+    let repo = TestRepo::new("up-leaf-precondition");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    assert_eq!(repo.current_branch(), "alpha");
+
+    let out = repo.gt("up", "");
+    assert!(!out.status.success(), "gt up on a leaf branch must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no valid child branch"),
+        "expected no-child precondition error; got stderr:\n{stderr}"
+    );
+    // Still on alpha; the failed command must not move HEAD.
+    assert_eq!(repo.current_branch(), "alpha");
+}
+
+#[test]
+fn up_with_multiple_children_prompts_with_deterministic_order() {
+    // main <- alpha <- (beta, gamma). From alpha, `gt up` should show a
+    // numbered prompt listing both children in sorted order, and pick the
+    // one named by the user's input.
+    let repo = TestRepo::new("up-branch-point");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    repo.create_with_gt("beta feature", "beta", "beta.txt", "beta\n");
+    repo.git(&["switch", "-q", "alpha"]);
+    repo.create_with_gt("gamma feature", "gamma", "gamma.txt", "gamma\n");
+    repo.git(&["switch", "-q", "alpha"]);
+
+    // Type the branch name to avoid coupling the test to numeric order.
+    let out = repo.gt("up", "gamma\n");
+    assert_success(&out, "gt up (alpha -> gamma)");
+    assert_eq!(repo.current_branch(), "gamma");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("child branch for `alpha`:"),
+        "expected prompt header; got stdout:\n{stdout}"
+    );
+    // Children render in sorted order, so beta is listed before gamma.
+    let beta_pos = stdout.find("beta").expect("beta in prompt");
+    let gamma_pos = stdout.find("gamma").expect("gamma in prompt");
+    assert!(
+        beta_pos < gamma_pos,
+        "children should be listed in sorted order; got stdout:\n{stdout}"
+    );
 }
