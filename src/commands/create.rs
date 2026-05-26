@@ -27,8 +27,11 @@ pub fn run() -> Result<()> {
         ));
     }
 
-    let message = prompt::input("commit message", None)?;
-    let default_name = slugify(&message);
+    let message = prompt::editor_message("commit message")?;
+    // The branch-name default uses only the first line of the message, since
+    // editor messages can be multi-line and the rest is body, not subject.
+    let subject = message.lines().next().unwrap_or("");
+    let default_name = slugify(subject);
     let name = prompt::input_branch_name("branch name", Some(&default_name))?;
 
     if git::branch_exists(&name)? {
