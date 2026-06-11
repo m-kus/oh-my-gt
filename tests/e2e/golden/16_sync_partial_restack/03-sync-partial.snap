@@ -1,7 +1,10 @@
-# step: sync-partial (exit=0)
-HEAD: b
-rebase: none
+# step: sync-partial (exit=1)
+HEAD: (detached)
+rebase: IN-PROGRESS
+conflicts:
+  shared.txt
 status:
+  UU shared.txt
 branches:
   a -> @a-feature-b105c8 tree=b105c81130f794739688d2677cbdefc9abfd0672
   b -> @b-feature tree=0ba0a935e3de0096d83ae885835ee229c33f7ec4

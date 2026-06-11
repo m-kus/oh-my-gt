@@ -1,13 +1,13 @@
-# `gt sync` must not leave the repo in a rebase-in-progress state when a
-# branch cannot be restacked cleanly. Branches that conflict are reported as
-# outdated; everything else restacks successfully.
+# A conflict on the current branch pauses `gt sync` in rebase mode so the
+# user can resolve it manually; `gt continue` then finishes the restack.
 #
-# Setup: main -> a -> b. We amend `a` directly with `git commit --amend` so
-# that gt is not aware (b's recorded fork point now points at the orphaned
-# pre-amend tip). main is advanced on the remote with an independent commit.
-# When sync replays the chain it should restack `a` onto the new main cleanly
-# but fail on `b` (b's commit overlaps with a's amended content) — leaving `b`
-# at its old tip.
+# Setup: main -> a -> b, with the user ON `b`. We amend `a` directly with
+# `git commit --amend` so that gt is not aware (b's recorded fork point now
+# points at the orphaned pre-amend tip). main is advanced on the remote with
+# an independent commit. When sync replays the chain it restacks `a` onto the
+# new main cleanly but conflicts on `b` (b's commit overlaps with a's amended
+# content). Because `b` is the current branch, sync pauses mid-rebase; the
+# resolution is committed with `gt continue`.
 
 commit "root commit" base.txt 0
 push_trunk
@@ -40,3 +40,8 @@ git reset -q --hard "$root"
 
 co b
 step sync-partial sync
+
+# Resolve the conflict on the current branch and finish the restack.
+resolve shared.txt "A_AMENDED
+b1"
+step continue-sync continue

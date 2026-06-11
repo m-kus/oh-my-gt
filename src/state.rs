@@ -32,6 +32,11 @@ pub struct Chain {
     pub old_base: String,
     #[serde(default)]
     pub done: bool,
+    /// Best-effort mode: this on-path chain already conflicted once and was
+    /// deferred to the end of the run; a second conflict pauses for manual
+    /// resolution instead of deferring again.
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 impl Chain {
@@ -54,6 +59,15 @@ pub struct OpState {
     pub chains: Vec<Chain>,
     /// Index of the chain currently being processed.
     pub current_chain: usize,
+    /// Whether `gt continue` resumes in best-effort mode (sync/restack)
+    /// rather than pause-on-every-conflict mode.
+    #[serde(default)]
+    pub best_effort: bool,
+    /// In best-effort mode, branches on the path from trunk to the branch
+    /// the user had checked out. Only conflicts here pause for manual
+    /// resolution; any other conflict just reports the branch.
+    #[serde(default)]
+    pub pause_branches: Vec<String>,
 }
 
 fn path() -> Result<PathBuf> {

@@ -47,19 +47,24 @@ pub fn run() -> Result<()> {
 }
 
 /// Offer the ancestor branches of `current` as parent candidates, best guess first.
+///
+/// Only the trunk and validly tracked branches qualify: stacking onto an
+/// untracked branch would leave `current` with an invalid parent, exactly the
+/// state `gt track` is meant to fix. The trunk is always offered, even when
+/// it advanced past the fork point (its tip is then not an ancestor).
 fn choose_parent(graph: &StackGraph, current: &str) -> Result<String> {
     let current_tip = &graph.get(current).unwrap().tip;
 
     let mut candidates: Vec<String> = Vec::new();
     for (name, node) in &graph.nodes {
-        if name == current {
+        if name == current || !node.validation.is_usable() {
             continue;
         }
         if git::is_ancestor(&node.tip, current_tip)? {
             candidates.push(name.clone());
         }
     }
-    if candidates.is_empty() {
+    if !candidates.contains(&graph.trunk) {
         candidates.push(graph.trunk.clone());
     }
     candidates.sort();

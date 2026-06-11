@@ -1,0 +1,16 @@
+# step: continue-sync (exit=0)
+HEAD: b
+rebase: none
+status:
+branches:
+  a -> @a-feature tree=b105c81130f794739688d2677cbdefc9abfd0672
+  b -> @b-feature tree=65c793f480ba8fe96d6b33f789bf09c8155307c1
+  main -> @remote-update tree=a6da0e9e5fb2f63afd70b3c91819ef4dbab48da5
+commits:
+@a-feature tree=b105c81130f794739688d2677cbdefc9abfd0672 parents=[@remote-update] a feature
+@b-feature tree=65c793f480ba8fe96d6b33f789bf09c8155307c1 parents=[@a-feature] b feature
+@remote-update tree=a6da0e9e5fb2f63afd70b3c91819ef4dbab48da5 parents=[@root-commit] remote update
+@root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
+metadata:
+  a: {"parentBranchName":"main","parentBranchRevision":"@remote-update"}
+  b: {"parentBranchName":"a","parentBranchRevision":"@a-feature"}

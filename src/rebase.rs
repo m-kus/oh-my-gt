@@ -6,7 +6,10 @@
 //! by the time a chain runs its parent's tip is already final.
 //!
 //! Conflicts pause the operation: state is persisted to `.git/oh-my-gt/` so
-//! `gt continue` resumes mid-plan and `gt abort` rolls every branch back.
+//! `gt continue` resumes mid-plan and `gt abort` rolls every branch back. In
+//! best-effort mode (`gt sync` / `gt restack`) only a conflict on the path to
+//! the user's checked-out branch pauses — and only after every other chain
+//! has been attempted; conflicts elsewhere just report the branch.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -24,16 +27,6 @@ pub struct RestackPlan {
     pub snapshot: Vec<BranchSnapshot>,
 }
 
-/// Outcome of a best-effort restack (used by `gt sync` and `gt restack`).
-///
-/// In best-effort mode, conflicts do not pause the operation; the offending
-/// chain is aborted cleanly and the branches in it (plus their downstream
-/// chains) are reported as outdated.
-pub struct BestEffortOutcome {
-    pub restacked: Vec<String>,
-    pub outdated: Vec<String>,
-}
-
 /// Up-front partition of branches into "worth attempting" and "stale".
 ///
 /// `gt sync` and `gt restack` use this to avoid pulling unrelated stale
@@ -45,6 +38,30 @@ pub struct CleanSelection {
     /// no longer in their parent's history, so a clean rebase is unlikely.
     /// Stable order, suitable for user-facing output.
     pub stale: Vec<String>,
+    /// Branches on the path from trunk to the current branch (inclusive) —
+    /// the user's active line of work. Only a conflict on one of these pauses
+    /// for manual resolution (see [`start_best_effort`]).
+    pub on_path: HashSet<String>,
+}
+
+impl CleanSelection {
+    /// Print the up-front skip notice for stale branches, if any.
+    pub fn print_stale(&self, style: &OutputStyle) {
+        if self.stale.is_empty() {
+            return;
+        }
+        let names = self
+            .stale
+            .iter()
+            .map(|b| style.branch(b).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "{} {} (run `gt restack` manually to retry)",
+            style.warning("skipped (stale):"),
+            names
+        );
+    }
 }
 
 /// Partition tracked branches into a clean (attempt) set and a stale (skip)
@@ -101,7 +118,11 @@ pub fn select_branches_for_clean_restack(graph: &StackGraph, current: &str) -> C
     // way other commands render branch names.
     let mut stale: Vec<String> = stale_set.into_iter().collect();
     stale.sort();
-    CleanSelection { clean, stale }
+    CleanSelection {
+        clean,
+        stale,
+        on_path,
+    }
 }
 
 /// Whether `branch`'s recorded `parent_branch_revision` is reachable from its
@@ -168,6 +189,7 @@ pub fn split_chains_per_branch(graph: &StackGraph, plan: &mut RestackPlan) {
                 old_base,
                 branches: vec![branch.clone()],
                 done: false,
+                deferred: false,
             });
         }
     }
@@ -273,6 +295,7 @@ fn plan_inner(
                 .unwrap(),
             branches,
             done: false,
+            deferred: false,
         });
     }
 
@@ -331,11 +354,20 @@ pub fn start(graph: &StackGraph, plan: RestackPlan) -> Result<()> {
     drive(st)
 }
 
-/// Like [`start`], but on conflicts the offending chain is cleanly aborted and
-/// reported as outdated rather than pausing the operation. Used by `gt sync`,
-/// which must never leave the repo in a rebase-in-progress state.
-pub fn start_best_effort(graph: &StackGraph, plan: RestackPlan) -> Result<BestEffortOutcome> {
-    let st = prepare(graph, plan)?;
+/// Like [`start`], but in best-effort mode (used by `gt sync` and
+/// `gt restack`): every chain is attempted, and only a conflict on a branch
+/// in `pause_on` — the path to the user's checked-out branch — pauses for
+/// manual resolution, after every cleanly-rebaseable chain has been done.
+/// A conflict anywhere else just reports the branch and moves on.
+pub fn start_best_effort(
+    graph: &StackGraph,
+    plan: RestackPlan,
+    pause_on: &HashSet<String>,
+) -> Result<()> {
+    let mut st = prepare(graph, plan)?;
+    st.best_effort = true;
+    st.pause_branches = pause_on.iter().cloned().collect();
+    st.pause_branches.sort();
     state::save(&st)?;
     drive_best_effort(st)
 }
@@ -359,6 +391,8 @@ fn prepare(graph: &StackGraph, plan: RestackPlan) -> Result<OpState> {
         snapshot: plan.snapshot,
         chains: plan.chains,
         current_chain: 0,
+        best_effort: false,
+        pause_branches: Vec::new(),
     })
 }
 
@@ -376,11 +410,20 @@ pub fn resume() -> Result<()> {
         }
         let code = git::run_interactive(&["rebase", "--continue"])?;
         if code != 0 {
-            return handle_rebase_exit(&mut st, &gd);
+            return handle_rebase_exit(&mut st, &gd, "");
         }
+        let chain = st.chains[st.current_chain].clone();
         finish_chain(&mut st)?;
+        let style = OutputStyle::stdout();
+        for b in &chain.branches {
+            println!("restacked {}", style.branch(b));
+        }
     }
-    drive(st)
+    if st.best_effort {
+        drive_best_effort(st)
+    } else {
+        drive(st)
+    }
 }
 
 /// Abort an in-progress operation (`gt abort`), restoring the prior state.
@@ -416,58 +459,78 @@ pub fn abort() -> Result<()> {
 
 // ── internals ───────────────────────────────────────────────────────────────
 
-/// Best-effort variant of [`drive`]: on conflict, abort the rebase, mark the
-/// chain (plus every downstream chain) as outdated, and continue.
-fn drive_best_effort(mut st: OpState) -> Result<BestEffortOutcome> {
-    let mut restacked: Vec<String> = Vec::new();
-    let mut outdated: HashSet<String> = HashSet::new();
-
-    while st.current_chain < st.chains.len() {
-        if st.chains[st.current_chain].done {
-            st.current_chain += 1;
-            continue;
-        }
-        // Skip chains whose parent was marked outdated — they cannot be cleanly
-        // restacked without first applying the upstream change.
-        if outdated.contains(&st.chains[st.current_chain].parent) {
-            for b in &st.chains[st.current_chain].branches {
-                outdated.insert(b.clone());
+/// Best-effort variant of [`drive`], used by `gt sync` and `gt restack`.
+///
+/// Scans the chains repeatedly until nothing is left, printing one status
+/// line per branch:
+/// * a clean rebase completes the chain;
+/// * a conflict off the user's path reports the branch (check it out and
+///   restack manually) and gives up on everything stacked on it;
+/// * a conflict on the user's path is deferred so every cleanly-rebaseable
+///   chain finishes first; when retried it pauses for manual resolution
+///   (`gt continue` / `gt abort`), exactly like [`drive`].
+fn drive_best_effort(mut st: OpState) -> Result<()> {
+    let style = OutputStyle::stdout();
+    loop {
+        let mut all_done = true;
+        for idx in 0..st.chains.len() {
+            if st.chains[idx].done {
+                continue;
             }
-            st.current_chain += 1;
-            continue;
-        }
+            // A deferred ancestor means this chain's base is not final yet;
+            // leave it for a later scan.
+            let parent = st.chains[idx].parent.clone();
+            let parent_pending = st
+                .chains
+                .iter()
+                .enumerate()
+                .any(|(j, c)| j != idx && !c.done && c.branches.contains(&parent));
+            if parent_pending {
+                all_done = false;
+                continue;
+            }
 
-        let chain = st.chains[st.current_chain].clone();
-        let new_base = git::branch_tip(&chain.parent)?;
-        let code = git::run_interactive(&[
-            "rebase",
-            "--update-refs",
-            "--committer-date-is-author-date",
-            "--empty=drop",
-            "--onto",
-            &new_base,
-            &chain.old_base,
-            "--",
-            chain.tip(),
-        ])?;
-        if code != 0 {
-            let gd = git::git_dir()?;
-            if git::rebase_in_progress(&gd) {
-                // Cleanly abort: never leave the repo in a rebase-in-progress
-                // state from `gt sync`.
+            st.current_chain = idx;
+            let chain = st.chains[idx].clone();
+            let new_base = git::branch_tip(&chain.parent)?;
+            let out = git::run_allow_fail(&[
+                "rebase",
+                "--update-refs",
+                "--committer-date-is-author-date",
+                "--empty=drop",
+                "--onto",
+                &new_base,
+                &chain.old_base,
+                "--",
+                chain.tip(),
+            ])?;
+            if out.code == 0 {
+                finish_chain(&mut st)?;
+                for b in &chain.branches {
+                    println!("restacked {}", style.branch(b));
+                }
+                continue;
+            }
+
+            let on_path = chain.branches.iter().any(|b| st.pause_branches.contains(b));
+            if on_path && chain.deferred {
+                // Second attempt: everything else is done, pause here.
+                let gd = git::git_dir()?;
+                return handle_rebase_exit(&mut st, &gd, &out.stderr);
+            }
+            if git::rebase_in_progress(&git::git_dir()?) {
                 let _ = git::run(&["rebase", "--abort"]);
             }
-            for b in &chain.branches {
-                outdated.insert(b.clone());
+            if on_path {
+                st.chains[idx].deferred = true;
+                all_done = false;
+            } else {
+                give_up_on_chain(&mut st, idx, &style);
             }
-            st.current_chain += 1;
             state::save(&st)?;
-            continue;
         }
-
-        finish_chain(&mut st)?;
-        for b in &chain.branches {
-            restacked.push(b.clone());
+        if all_done {
+            break;
         }
     }
 
@@ -475,25 +538,45 @@ fn drive_best_effort(mut st: OpState) -> Result<BestEffortOutcome> {
     if let Some(rb) = &st.return_branch {
         git::switch_if_exists(rb)?;
     }
-
-    // Stable order: report outdated branches in the order they appear in the
-    // plan so the summary is deterministic for tests.
-    let mut outdated_list: Vec<String> = Vec::new();
-    for chain in &st.chains {
-        for b in &chain.branches {
-            if outdated.contains(b) && !outdated_list.contains(b) {
-                outdated_list.push(b.clone());
-            }
-        }
-    }
-    Ok(BestEffortOutcome {
-        restacked,
-        outdated: outdated_list,
-    })
+    Ok(())
 }
 
-/// Run chains from `current_chain` onward.
+/// Report a chain that cannot be restacked automatically and mark it — plus
+/// every chain stacked on it — as done so it is never retried this run.
+fn give_up_on_chain(st: &mut OpState, idx: usize, style: &OutputStyle) {
+    let mut given_up: HashSet<String> = HashSet::new();
+    for b in &st.chains[idx].branches {
+        given_up.insert(b.clone());
+        println!(
+            "{} {} cannot be restacked automatically; check it out and run `gt restack` to \
+             resolve manually",
+            style.warning("conflict:"),
+            style.branch(b)
+        );
+    }
+    st.chains[idx].done = true;
+    // Chains are planned parent-first, so a single forward sweep reaches
+    // every chain transitively stacked on the conflicted one.
+    for chain in st.chains.iter_mut().skip(idx + 1) {
+        if chain.done || !given_up.contains(&chain.parent) {
+            continue;
+        }
+        for b in &chain.branches {
+            given_up.insert(b.clone());
+            println!(
+                "{} {} (parent not restacked)",
+                style.warning("skipped:"),
+                style.branch(b)
+            );
+        }
+        chain.done = true;
+    }
+}
+
+/// Run chains from `current_chain` onward, printing one status line per
+/// restacked branch. The raw `git rebase` output is captured, not shown.
 fn drive(mut st: OpState) -> Result<()> {
+    let style = OutputStyle::stdout();
     while st.current_chain < st.chains.len() {
         if st.chains[st.current_chain].done {
             st.current_chain += 1;
@@ -502,7 +585,7 @@ fn drive(mut st: OpState) -> Result<()> {
         let chain = st.chains[st.current_chain].clone();
         // The parent's tip is final now (its chain ran earlier).
         let new_base = git::branch_tip(&chain.parent)?;
-        let code = git::run_interactive(&[
+        let out = git::run_allow_fail(&[
             "rebase",
             "--update-refs",
             "--committer-date-is-author-date",
@@ -513,11 +596,14 @@ fn drive(mut st: OpState) -> Result<()> {
             "--",
             chain.tip(),
         ])?;
-        if code != 0 {
+        if out.code != 0 {
             let gd = git::git_dir()?;
-            return handle_rebase_exit(&mut st, &gd);
+            return handle_rebase_exit(&mut st, &gd, &out.stderr);
         }
         finish_chain(&mut st)?;
+        for b in &chain.branches {
+            println!("restacked {}", style.branch(b));
+        }
     }
     complete(st)
 }
@@ -545,17 +631,23 @@ fn finish_chain(st: &mut OpState) -> Result<()> {
 }
 
 /// React to a non-zero `git rebase` exit: pause on a conflict, else error.
-fn handle_rebase_exit(st: &mut OpState, git_dir: &Path) -> Result<()> {
+/// `detail` is the captured stderr, surfaced on an unexpected failure.
+fn handle_rebase_exit(st: &mut OpState, git_dir: &Path, detail: &str) -> Result<()> {
     if !git::rebase_in_progress(git_dir) {
-        return Err(GtError::Git("git rebase failed unexpectedly".into()));
+        let msg = if detail.is_empty() {
+            "git rebase failed unexpectedly".to_string()
+        } else {
+            format!("git rebase failed unexpectedly:\n{detail}")
+        };
+        return Err(GtError::Git(msg));
     }
     state::save(st)?; // current_chain still points at the failing chain
     let chain = &st.chains[st.current_chain];
     let style = OutputStyle::stdout();
     println!();
     println!(
-        "{} while restacking `{}`",
-        style.warning("CONFLICT"),
+        "{} `{}` cannot be restacked automatically",
+        style.warning("conflict:"),
         chain.tip()
     );
     let files = git::conflicted_files().unwrap_or_default();
@@ -565,18 +657,17 @@ fn handle_rebase_exit(st: &mut OpState, git_dir: &Path) -> Result<()> {
             println!("  {f}");
         }
     }
-    println!("resolve the conflicts, `git add` them, then run `gt continue`");
-    println!("or run `gt abort` to undo and restore the previous state");
+    println!("resolve the conflicts manually, `git add` them, then run `gt continue`");
+    println!("or run `gt abort` to undo the rebase and restore the previous state");
     Err(GtError::Paused)
 }
 
-/// Finish a fully-applied operation.
+/// Finish a fully-applied operation. Each branch already got its own
+/// `restacked` line, so there is nothing left to report.
 fn complete(st: OpState) -> Result<()> {
     state::clear()?;
     if let Some(rb) = &st.return_branch {
         git::switch_if_exists(rb)?;
     }
-    let n: usize = st.chains.iter().map(|c| c.branches.len()).sum();
-    println!("restacked {n} branch{}", if n == 1 { "" } else { "es" });
     Ok(())
 }

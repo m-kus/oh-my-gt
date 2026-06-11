@@ -227,8 +227,10 @@ pub fn status_porcelain() -> Result<String> {
 }
 
 /// Whether the working tree has uncommitted changes (staged or unstaged).
+/// Untracked files don't count: rebase and switch never touch them, and git
+/// itself refuses to overwrite one rather than discarding it.
 pub fn is_dirty() -> Result<bool> {
-    Ok(!status_porcelain()?.is_empty())
+    Ok(!run(&["status", "--porcelain", "--untracked-files=no"])?.is_empty())
 }
 
 /// Whether there are staged changes ready to commit.

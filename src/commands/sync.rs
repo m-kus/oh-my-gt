@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use crate::error::Result;
-use crate::graph::StackGraph;
+use crate::graph::{StackGraph, Validation};
 use crate::style::OutputStyle;
 use crate::{gh, git, meta, prompt, rebase};
 
@@ -58,6 +58,24 @@ pub fn run() -> Result<()> {
     git::run(&["switch", "--", &landing])?;
 
     let survivors = StackGraph::load()?;
+
+    // An untracked checked-out branch is invisible to the restack. Say so
+    // explicitly — otherwise the user is left wondering whether their own
+    // branch was rebased.
+    if let Some(b) = &original {
+        let untracked = survivors
+            .get(b)
+            .is_some_and(|n| !matches!(n.validation, Validation::Valid | Validation::Trunk));
+        if untracked {
+            println!(
+                "{} current branch {} is not tracked by gt and will not be restacked; \
+                 run `gt track` to stack it",
+                style.warning("note:"),
+                style.branch(b)
+            );
+        }
+    }
+
     let roots: Vec<String> = survivors
         .get(&trunk)
         .map(|n| n.children.clone())
@@ -74,74 +92,19 @@ pub fn run() -> Result<()> {
         _ => trunk.clone(),
     };
     let selection = rebase::select_branches_for_clean_restack(&survivors, &current_for_selection);
+    selection.print_stale(&style);
     let mut plan = rebase::plan_clean(&survivors, &roots, "sync", &selection.clean)?;
     if plan.chains.is_empty() {
-        print_outcome(
-            &rebase::BestEffortOutcome {
-                restacked: Vec::new(),
-                outdated: Vec::new(),
-            },
-            &selection,
-            &style,
-        );
+        if selection.stale.is_empty() {
+            println!("the stack is already up to date");
+        }
         return Ok(());
     }
     plan.snapshot = rollback_snapshot;
     // Sync uses per-branch chains so a conflict on one branch does not
     // discard work already done on an earlier branch in the same chain.
     rebase::split_chains_per_branch(&survivors, &mut plan);
-    let outcome = rebase::start_best_effort(&survivors, plan)?;
-    print_outcome(&outcome, &selection, &style);
-    Ok(())
-}
-
-/// Summarize a best-effort restack: which branches moved, which were left
-/// outdated or skipped and need manual attention.
-fn print_outcome(
-    outcome: &rebase::BestEffortOutcome,
-    selection: &rebase::CleanSelection,
-    style: &OutputStyle,
-) {
-    if !outcome.restacked.is_empty() {
-        println!(
-            "restacked: {}",
-            outcome
-                .restacked
-                .iter()
-                .map(|b| style.branch(b).to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-    }
-    if !selection.stale.is_empty() {
-        let names = selection
-            .stale
-            .iter()
-            .map(|b| style.branch(b).to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        println!(
-            "{} {} (run `gt restack` manually to retry)",
-            style.warning("skipped (stale):"),
-            names
-        );
-    }
-    if !outcome.outdated.is_empty() {
-        let names = outcome
-            .outdated
-            .iter()
-            .map(|b| style.branch(b).to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        println!(
-            "{} {} (conflicts; needs manual restack)",
-            style.warning("outdated:"),
-            names
-        );
-    }
-    if outcome.restacked.is_empty() && outcome.outdated.is_empty() && selection.stale.is_empty() {
-        println!("the stack is already up to date");
-    }
+    rebase::start_best_effort(&survivors, plan, &selection.on_path)
 }
 
 /// Fast-forward the trunk branch to its remote tip, if possible.

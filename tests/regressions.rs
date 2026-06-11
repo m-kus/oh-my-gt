@@ -1019,6 +1019,79 @@ fn sync_refuses_when_other_trunk_worktree_is_dirty() {
 }
 
 #[test]
+fn sync_restacks_with_untracked_files_present() {
+    // Untracked files (e.g. .env, editor scratch dirs) never block a rebase —
+    // git refuses to overwrite an untracked file rather than discarding it —
+    // so sync must proceed and leave them exactly where they are.
+    let repo = TestRepo::new("sync-untracked-files");
+    repo.add_origin();
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    advance_origin_main(&repo, "upstream commit", "upstream.txt", "upstream\n");
+
+    repo.write("scratch.env", "SECRET=1\n");
+
+    let out = repo.gt("sync", "");
+    assert_success(&out, "gt sync");
+
+    // The feature branch was restacked onto the new trunk tip.
+    assert_eq!(
+        repo.git(&["merge-base", "alpha", "main"]),
+        repo.git(&["rev-parse", "main"]),
+        "alpha must be restacked onto the advanced trunk"
+    );
+    // And the untracked file survived untouched.
+    assert_eq!(
+        fs::read_to_string(repo.repo.join("scratch.env")).unwrap(),
+        "SECRET=1\n",
+        "untracked file must survive sync untouched"
+    );
+}
+
+#[test]
+fn sync_still_refuses_with_modified_tracked_files() {
+    // Unlike untracked files, edits to tracked files could be clobbered by a
+    // rebase, so the clean-tree precondition must still hold for them.
+    let repo = TestRepo::new("sync-modified-tracked");
+    repo.add_origin();
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    advance_origin_main(&repo, "upstream commit", "upstream.txt", "upstream\n");
+    let alpha_tip_before = repo.git(&["rev-parse", "alpha"]);
+
+    repo.write("alpha.txt", "alpha\nedited\n");
+
+    let out = repo.gt("sync", "");
+    assert!(
+        !out.status.success(),
+        "gt sync must fail with modified tracked files; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("uncommitted changes"),
+        "expected the clean-tree precondition error; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "alpha"]),
+        alpha_tip_before,
+        "alpha must not move when the working tree has tracked edits"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.repo.join("alpha.txt")).unwrap(),
+        "alpha\nedited\n",
+        "the user's edit must remain exactly as they left it"
+    );
+}
+
+#[test]
 fn modify_does_not_print_hint_without_submitted_descendants() {
     // main <- a <- b with NO PR info anywhere. The modify hint is purely a
     // re-submit nudge, so it must stay silent here.
@@ -1042,17 +1115,134 @@ fn modify_does_not_print_hint_without_submitted_descendants() {
 }
 
 #[test]
-fn sync_marks_unrestackable_branches_outdated_without_leaving_rebase_in_progress() {
-    // main <- a <- b. We amend `a` directly (bypassing `gt modify`, which
-    // would restack b eagerly), so b's recorded fork point now lags behind
-    // a's new tip and rebasing b's commit onto the amended a would conflict.
-    // Then we advance `origin/main` so sync has work to do. The expected
-    // behavior is:
-    //   * `a` is cleanly restacked onto the new main.
-    //   * `b` is left at its old tip and reported as outdated.
-    //   * The repo is NOT in a rebase-in-progress state at exit.
-    //   * The state.json conflict-resume file is cleared.
-    let repo = TestRepo::new("sync-partial-restack");
+fn sync_warns_when_current_branch_is_untracked() {
+    // The user is on a plain git branch that gt never tracked. Sync must say
+    // explicitly that this branch will not be restacked (and how to fix it),
+    // while still restacking the tracked stack.
+    let repo = TestRepo::new("sync-untracked-current");
+    repo.add_origin();
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    repo.create_with_gt("a feature", "a", "a.txt", "a\n");
+
+    // An untracked branch made with plain git, no gt metadata.
+    repo.git(&["switch", "-q", "main"]);
+    repo.git(&["switch", "-q", "-c", "loose"]);
+    repo.write("loose.txt", "loose\n");
+    repo.commit("loose work");
+    let loose_tip_before = repo.git(&["rev-parse", "loose"]);
+
+    advance_origin_main(&repo, "upstream commit", "upstream.txt", "upstream\n");
+
+    let out = repo.gt("sync", "");
+    assert_success(&out, "gt sync");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("loose is not tracked by gt") && stdout.contains("gt track"),
+        "sync must warn that the current branch is untracked; got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("restacked a"),
+        "sync should still restack the tracked stack; got stdout:\n{stdout}"
+    );
+
+    // The untracked branch is untouched and still checked out.
+    assert_eq!(
+        repo.git(&["rev-parse", "loose"]),
+        loose_tip_before,
+        "an untracked branch must never be rewritten by sync"
+    );
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--short", "HEAD"]),
+        "loose",
+        "sync must return to the original branch"
+    );
+}
+
+#[test]
+fn restack_errors_on_untracked_current_branch() {
+    // `gt restack` on an untracked branch used to claim "the stack is
+    // already up to date" — misleading, since gt was not managing the branch
+    // at all. It must error with a pointer to `gt track` instead.
+    let repo = TestRepo::new("restack-untracked-current");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+
+    repo.git(&["switch", "-q", "-c", "loose"]);
+    repo.write("loose.txt", "loose\n");
+    repo.commit("loose work");
+
+    let out = repo.gt("restack", "");
+    assert!(
+        !out.status.success(),
+        "gt restack must fail on an untracked branch; stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not tracked") && stderr.contains("gt track"),
+        "the error must point at `gt track`; got stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn track_offers_trunk_even_when_branch_is_behind_and_skips_untracked_decoys() {
+    // The user's branch forked from an older main (trunk advanced past the
+    // fork point, so main's tip is NOT an ancestor of the branch tip), and a
+    // stale untracked branch points into the branch's own history. `gt track`
+    // must offer main — the only usable parent — and not the untracked decoy,
+    // which would produce an invalid stack.
+    let repo = TestRepo::new("track-behind-main");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+
+    repo.git(&["switch", "-q", "-c", "loose"]);
+    repo.write("loose.txt", "loose\n");
+    repo.commit("loose work");
+    repo.write("loose.txt", "loose\nmore\n");
+    repo.commit("more loose work");
+
+    // A stale untracked branch inside loose's history (like a worktree base).
+    repo.git(&["branch", "decoy", "loose~1"]);
+
+    // Advance main so loose is behind it.
+    repo.git(&["switch", "-q", "main"]);
+    repo.write("upstream.txt", "upstream\n");
+    repo.commit("upstream commit");
+    repo.git(&["switch", "-q", "loose"]);
+
+    // main is the only candidate, so it is chosen without prompting.
+    let out = repo.gt("track", "");
+    assert_success(&out, "gt track");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tracked") && stdout.contains("main"),
+        "track should parent the branch onto main; got stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("decoy"),
+        "untracked branches must not be offered as parents; got stdout:\n{stdout}"
+    );
+
+    // Metadata records main as parent with the true fork point.
+    let meta = repo.git(&["cat-file", "-p", "refs/branch-metadata/loose"]);
+    assert!(
+        meta.contains(r#""parentBranchName":"main""#),
+        "expected main as recorded parent; got metadata:\n{meta}"
+    );
+}
+
+#[test]
+fn sync_pauses_when_current_branch_conflicts_then_continue_finishes() {
+    // main <- a <- b, with the user ON `b`. We amend `a` directly (bypassing
+    // `gt modify`, which would restack b eagerly), so rebasing b's commit
+    // onto the amended a conflicts. Then we advance `origin/main` so sync has
+    // work to do. Because `b` is the current branch, sync must NOT abort the
+    // conflicted rebase: it pauses so the user can resolve manually, and
+    // `gt continue` finishes the restack.
+    let repo = TestRepo::new("sync-pause-current");
     repo.add_origin();
     repo.write("base.txt", "base\n");
     repo.commit("root commit");
@@ -1061,66 +1251,242 @@ fn sync_marks_unrestackable_branches_outdated_without_leaving_rebase_in_progress
     // a touches shared.txt. b extends the same file — the line a touches.
     repo.create_with_gt("a feature", "a", "shared.txt", "a1\n");
     repo.create_with_gt("b feature", "b", "shared.txt", "a1\nb1\n");
-    let b_tip_before = repo.git(&["rev-parse", "b"]);
 
-    // Amend `a` directly so b's parent_branch_revision metadata is now stale
-    // and b's commit (which rewrites shared.txt to "a1\nb1") will conflict
-    // against an a-tip that says "A_AMENDED".
+    // Amend `a` directly so b's commit (which rewrites shared.txt to
+    // "a1\nb1") will conflict against an a-tip that says "A_AMENDED".
     repo.git(&["switch", "-q", "a"]);
     repo.write("shared.txt", "A_AMENDED\n");
     repo.git(&["add", "shared.txt"]);
     repo.git(&["commit", "--amend", "--no-edit", "-q"]);
 
-    // Advance origin/main with a non-conflicting commit; rewinding local main
-    // is not necessary because the helper pushes via a side worktree and
-    // local main is left at the original tip.
     advance_origin_main(&repo, "upstream commit", "upstream.txt", "upstream\n");
 
     repo.git(&["switch", "-q", "b"]);
     let out = repo.gt("sync", "");
 
-    assert_success(&out, "gt sync");
+    // Sync exits non-zero (paused), with `a` already restacked and clear
+    // instructions for `b`.
+    assert!(
+        !out.status.success(),
+        "gt sync must exit non-zero when paused on a conflict; stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("restacked: a"),
+        stdout.contains("restacked a"),
         "sync should report `a` as restacked; got stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("outdated:") && stdout.contains(" b "),
-        "sync should report `b` as outdated; got stdout:\n{stdout}"
+        stdout.contains("`b` cannot be restacked automatically")
+            && stdout.contains("gt continue")
+            && stdout.contains("gt abort"),
+        "sync should pause with resolution instructions for `b`; got stdout:\n{stdout}"
     );
 
-    // No rebase-in-progress directory remains.
+    // The rebase is left in progress, with the resume state file present.
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists(),
+        "a conflict on the current branch must stay in rebase mode"
+    );
+    assert!(
+        git_dir.join("oh-my-gt").join("state.json").exists(),
+        "the resume state file must be kept while paused"
+    );
+
+    // Resolve the conflict and continue.
+    repo.write("shared.txt", "A_AMENDED\nb1\n");
+    repo.git(&["add", "shared.txt"]);
+    let out = repo.gt("continue", "");
+    assert_success(&out, "gt continue");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("restacked b"),
+        "continue should report `b` as restacked; got stdout:\n{stdout}"
+    );
+
+    // The whole stack now sits on the new trunk: main <- a <- b.
+    let new_main = repo.git(&["rev-parse", "main"]);
+    assert_eq!(
+        repo.git(&["rev-parse", "a^"]),
+        new_main,
+        "a should now be parented on the advanced main"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "b^"]),
+        repo.git(&["rev-parse", "a"]),
+        "b should now be parented on the restacked a"
+    );
+    assert_eq!(
+        repo.git(&["show", "b:shared.txt"]),
+        "A_AMENDED\nb1",
+        "b must carry the manually resolved content"
+    );
+
+    // Fully cleaned up: no rebase in progress, no state file, back on `b`.
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "continue must finish the rebase"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "continue must clear the state file on completion"
+    );
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--short", "HEAD"]),
+        "b",
+        "continue must return to the original branch"
+    );
+    assert!(
+        repo.git(&["status", "--porcelain"]).is_empty(),
+        "the working tree must be clean after continue"
+    );
+}
+
+#[test]
+fn sync_reports_off_path_conflicts_and_completes() {
+    // Tree:
+    //   main
+    //     b   (off-path sibling whose commit conflicts with the new trunk)
+    //     z   (current; restacks cleanly)
+    //
+    // `b`'s recorded fork point is still an ancestor of the new main, so it
+    // is attempted — but its commit conflicts with the upstream change. Since
+    // `b` is NOT the checked-out branch, sync must report it (with a hint to
+    // check it out and restack) and finish cleanly without pausing.
+    let repo = TestRepo::new("sync-offpath-report");
+    repo.add_origin();
+    repo.write("shared.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    repo.create_with_gt("b feature", "b", "shared.txt", "base\nb1\n");
+    let b_tip_before = repo.git(&["rev-parse", "b"]);
+    repo.git(&["switch", "-q", "main"]);
+    repo.create_with_gt("z feature", "z", "z.txt", "z\n");
+
+    // Upstream rewrites shared.txt, so replaying b's commit conflicts.
+    advance_origin_main(&repo, "upstream commit", "shared.txt", "UPSTREAM\n");
+
+    repo.git(&["switch", "-q", "z"]);
+    let out = repo.gt("sync", "");
+
+    assert_success(&out, "gt sync");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("restacked z"),
+        "sync should report `z` as restacked; got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("b cannot be restacked automatically")
+            && stdout.contains("check it out and run `gt restack`"),
+        "sync should tell the user how to resolve `b` manually; got stdout:\n{stdout}"
+    );
+
+    // No rebase-in-progress directory remains, and no dangling state file.
     let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
     assert!(
         !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
-        "sync must not leave the repo in a rebase-in-progress state"
+        "an off-path conflict must not leave the repo in a rebase-in-progress state"
     );
-    // And the conflict-resume state file is not left dangling.
     assert!(
         !git_dir.join("oh-my-gt").join("state.json").exists(),
-        "sync must clear its state file even when some branches are outdated"
+        "sync must clear its state file even when some branches conflicted"
     );
 
-    // `a` was rebased onto the new trunk tip.
+    // `z` was rebased onto the new trunk tip; `b` was left untouched.
     let new_main = repo.git(&["rev-parse", "main"]);
-    let a_parent = repo.git(&["rev-parse", "a^"]);
     assert_eq!(
-        a_parent, new_main,
-        "a should now be parented on the advanced main"
+        repo.git(&["rev-parse", "z^"]),
+        new_main,
+        "z should now be parented on the advanced main"
     );
-
-    // `b` was NOT rewritten; its tip is exactly what it was pre-sync.
-    let b_tip_after = repo.git(&["rev-parse", "b"]);
     assert_eq!(
-        b_tip_after, b_tip_before,
+        repo.git(&["rev-parse", "b"]),
+        b_tip_before,
         "b must be left untouched when its restack cannot be applied cleanly"
     );
 
     // Working tree is clean; status is empty.
     assert!(
         repo.git(&["status", "--porcelain"]).is_empty(),
-        "sync must leave a clean working tree even when some branches are outdated"
+        "sync must leave a clean working tree even when some branches conflicted"
+    );
+}
+
+#[test]
+fn sync_defers_current_branch_conflict_until_clean_branches_finish() {
+    // Tree:
+    //   main
+    //     a   (current; its commit conflicts with the new trunk)
+    //     z   (off-path sibling; restacks cleanly)
+    //
+    // `a` sorts before `z`, so it is attempted first and conflicts. Sync must
+    // defer it, finish the cleanly-rebaseable `z`, and only then pause on
+    // `a`'s conflict for manual resolution.
+    let repo = TestRepo::new("sync-defer-current");
+    repo.add_origin();
+    repo.write("shared.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    repo.create_with_gt("a feature", "a", "shared.txt", "base\na1\n");
+    repo.git(&["switch", "-q", "main"]);
+    repo.create_with_gt("z feature", "z", "z.txt", "z\n");
+
+    // Upstream rewrites shared.txt, so replaying a's commit conflicts.
+    advance_origin_main(&repo, "upstream commit", "shared.txt", "UPSTREAM\n");
+
+    repo.git(&["switch", "-q", "a"]);
+    let out = repo.gt("sync", "");
+
+    assert!(
+        !out.status.success(),
+        "gt sync must exit non-zero when paused on a conflict; stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("restacked z"),
+        "sync should restack `z` before pausing on `a`; got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("`a` cannot be restacked automatically") && stdout.contains("gt continue"),
+        "sync should pause with resolution instructions for `a`; got stdout:\n{stdout}"
+    );
+
+    // `z` already sits on the new trunk while `a` is paused mid-conflict.
+    let new_main = repo.git(&["rev-parse", "main"]);
+    assert_eq!(
+        repo.git(&["rev-parse", "z^"]),
+        new_main,
+        "z must already be restacked when the pause happens"
+    );
+
+    // Resolve and continue.
+    repo.write("shared.txt", "UPSTREAM\na1\n");
+    repo.git(&["add", "shared.txt"]);
+    let out = repo.gt("continue", "");
+    assert_success(&out, "gt continue");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("restacked a"),
+        "continue should report `a` as restacked; got stdout:\n{stdout}"
+    );
+
+    assert_eq!(
+        repo.git(&["rev-parse", "a^"]),
+        new_main,
+        "a should be parented on the advanced main after continue"
+    );
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--short", "HEAD"]),
+        "a",
+        "continue must return to the original branch"
+    );
+    assert!(
+        repo.git(&["status", "--porcelain"]).is_empty(),
+        "the working tree must be clean after continue"
     );
 }
 
@@ -1174,7 +1540,7 @@ fn restack_skips_stale_branches_off_the_current_path() {
     assert_success(&out, "gt restack");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("restacked: a"),
+        stdout.contains("restacked a"),
         "gt restack should report `a` as restacked; got stdout:\n{stdout}"
     );
     assert!(
@@ -1269,7 +1635,7 @@ fn sync_skips_stale_upstream_branches_not_on_current_path() {
     assert_success(&out, "gt sync");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("restacked: a"),
+        stdout.contains("restacked a"),
         "sync should report `a` as restacked; got stdout:\n{stdout}"
     );
     assert!(
