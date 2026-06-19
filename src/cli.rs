@@ -74,9 +74,19 @@ pub fn run() -> Result<()> {
             | "down"
     );
     if needs_idle && crate::state::exists() {
-        return Err(GtError::State(
-            "an operation is in progress — run `gt continue` or `gt abort` first".into(),
-        ));
+        // A recorded operation normally means a paused git rebase. If git is
+        // no longer mid-rebase, the rebase was ended out of band with native
+        // `git rebase` commands — `git status` will look clean even though gt
+        // still holds the operation. Say which case it is so the contradictory
+        // states don't read as a bug.
+        let msg = if git::rebase_in_progress(&git::git_dir()?) {
+            "an operation is in progress — run `gt continue` or `gt abort` first"
+        } else {
+            "gt has a paused restack recorded, but its git rebase is no longer in progress \
+             (it was ended with native `git rebase`, so `git status` looks clean). Run \
+             `gt continue` to reconcile and finish it, or `gt abort` to discard it"
+        };
+        return Err(GtError::State(msg.into()));
     }
 
     match cmd.as_str() {

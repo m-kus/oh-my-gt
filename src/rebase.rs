@@ -402,6 +402,7 @@ pub fn resume() -> Result<()> {
         .ok_or_else(|| GtError::Usage("no operation in progress to continue".into()))?;
 
     let gd = git::git_dir()?;
+    let style = OutputStyle::stdout();
     if git::rebase_in_progress(&gd) {
         if !git::conflicted_files()?.is_empty() {
             return Err(GtError::Precondition(
@@ -414,10 +415,30 @@ pub fn resume() -> Result<()> {
         }
         let chain = st.chains[st.current_chain].clone();
         finish_chain(&mut st)?;
-        let style = OutputStyle::stdout();
         for b in &chain.branches {
             println!("restacked {}", style.branch(b));
         }
+    } else {
+        // gt has a paused restack recorded, but git is not mid-rebase: the
+        // rebase gt started was finished or aborted out of band with native
+        // `git rebase` commands. Re-driving the plan from the current branch
+        // tips reconciles either case — a chain the user already replayed
+        // becomes a no-op (its commits are dropped as empty), and one they
+        // undid simply runs again. But only when the tree is clean: a stray
+        // change would otherwise be lost to, or block, the replay.
+        if git::is_dirty()? {
+            return Err(GtError::Precondition(
+                "the rebase gt paused is no longer in progress, and the working tree has \
+                 uncommitted changes. Commit or stash them, then run `gt continue` — or run \
+                 `gt abort` to discard the in-progress restack."
+                    .into(),
+            ));
+        }
+        println!(
+            "{} the git rebase ended outside gt (with native `git rebase`); reconciling and \
+             continuing the restack",
+            style.warning("note:")
+        );
     }
     if st.best_effort {
         drive_best_effort(st)
@@ -431,8 +452,21 @@ pub fn abort() -> Result<()> {
     let st =
         state::load()?.ok_or_else(|| GtError::Usage("no operation in progress to abort".into()))?;
 
+    let style = OutputStyle::stdout();
     if git::rebase_in_progress(&git::git_dir()?) {
         git::run(&["rebase", "--abort"])?;
+    } else {
+        // The rebase gt paused is already gone — finished or aborted out of
+        // band with native `git rebase`. We still roll the recorded branches
+        // back to their pre-operation tips (that is what `abort` promises),
+        // but say so: if the user resolved the rebase by hand, this rewinds
+        // that result. The rewound commits stay reachable through git's reflog,
+        // so this is recoverable, not destructive.
+        println!(
+            "{} no git rebase is in progress (it was ended outside gt); restoring the \
+             pre-operation state anyway",
+            style.warning("note:")
+        );
     }
 
     // Roll every touched branch back to its pre-operation tip and metadata.
@@ -659,6 +693,11 @@ fn handle_rebase_exit(st: &mut OpState, git_dir: &Path, detail: &str) -> Result<
     }
     println!("resolve the conflicts manually, `git add` them, then run `gt continue`");
     println!("or run `gt abort` to undo the rebase and restore the previous state");
+    println!(
+        "{} drive this with gt, not `git rebase --continue` / `git rebase --abort` — \
+         resolving the rebase with git directly leaves gt out of sync",
+        style.warning("note:")
+    );
     Err(GtError::Paused)
 }
 
