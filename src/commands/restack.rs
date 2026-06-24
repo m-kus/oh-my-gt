@@ -35,9 +35,16 @@ pub fn run() -> Result<()> {
         }
         return Ok(());
     }
-    // Per-branch chains so that a conflict on one branch leaves earlier
-    // branches in the same chain restacked cleanly — same trade-off `gt sync`
-    // makes.
+    // The common case: a single linear chain (the current stack, no branch
+    // points). Replay it as one `git rebase --update-refs` with no resume state
+    // of its own — git owns the paused state, so `git status` and gt agree and
+    // native `git rebase --continue` / `--abort` work as expected.
+    if plan.chains.len() == 1 {
+        return rebase::restack_native(plan.chains.remove(0), &current);
+    }
+    // Branch points: fall back to the state-backed engine. Per-branch chains so
+    // a conflict on one branch leaves earlier branches in the same chain
+    // restacked cleanly — the same trade-off `gt sync` makes.
     rebase::split_chains_per_branch(&graph, &mut plan);
     rebase::start_best_effort(&graph, plan, &selection.on_path)
 }

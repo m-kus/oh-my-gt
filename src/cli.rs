@@ -73,20 +73,29 @@ pub fn run() -> Result<()> {
             | "up"
             | "down"
     );
-    if needs_idle && crate::state::exists() {
-        // A recorded operation normally means a paused git rebase. If git is
-        // no longer mid-rebase, the rebase was ended out of band with native
-        // `git rebase` commands — `git status` will look clean even though gt
-        // still holds the operation. Say which case it is so the contradictory
-        // states don't read as a bug.
-        let msg = if git::rebase_in_progress(&git::git_dir()?) {
-            "an operation is in progress — run `gt continue` or `gt abort` first"
-        } else {
-            "gt has a paused restack recorded, but its git rebase is no longer in progress \
-             (it was ended with native `git rebase`, so `git status` looks clean). Run \
-             `gt continue` to reconcile and finish it, or `gt abort` to discard it"
-        };
-        return Err(GtError::State(msg.into()));
+    if needs_idle {
+        let live_rebase = git::rebase_in_progress(&git::git_dir()?);
+        if crate::state::exists() {
+            // A recorded multi-step operation. If git is no longer mid-rebase,
+            // the rebase was ended out of band with native `git rebase` —
+            // `git status` looks clean even though gt still holds the op. Say
+            // which case it is so the contradictory states don't read as a bug.
+            let msg = if live_rebase {
+                "an operation is in progress — run `gt continue` or `gt abort` first"
+            } else {
+                "gt has a paused restack recorded, but its git rebase is no longer in progress \
+                 (it was ended with native `git rebase`, so `git status` looks clean). Run \
+                 `gt continue` to reconcile and finish it, or `gt abort` to discard it"
+            };
+            return Err(GtError::State(msg.into()));
+        } else if live_rebase {
+            // A git-native restack is paused (no state file). git owns it.
+            return Err(GtError::State(
+                "a git rebase is in progress — run `gt continue` to finish the restack or \
+                 `gt abort` to undo it"
+                    .into(),
+            ));
+        }
     }
 
     match cmd.as_str() {

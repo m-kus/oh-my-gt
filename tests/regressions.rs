@@ -1678,96 +1678,48 @@ fn sync_skips_stale_upstream_branches_not_on_current_path() {
     );
 }
 
-#[test]
-fn restack_reconciles_when_user_ends_rebase_with_native_git() {
-    // Regression for the desync where gt's state.json outlives the git rebase
-    // it represents. gt pauses a restack by leaving a live, detached-HEAD
-    // `git rebase` — and git's own status output tells the user to drive it
-    // with `git rebase --continue` / `--abort`. If the user follows git's
-    // advice instead of gt's, git's rebase state clears while gt's state file
-    // lingers: `git status` then reports no rebase even though gt still holds
-    // the operation. gt must detect this and reconcile rather than wedge.
-    //
-    // main <- a <- b, user ON `b`. Amending `a` directly makes replaying b's
-    // commit conflict, so `gt restack` pauses on `b`.
-    let repo = TestRepo::new("restack-native-rebase-desync");
+/// Build `main <- a <- b` (linear), then amend `a` so replaying b's commit
+/// conflicts. Leaves HEAD on `b`. Returns (repo, git_dir, b's pre-restack tip).
+fn linear_conflict_repo(name: &str) -> (TestRepo, PathBuf, String) {
+    let repo = TestRepo::new(name);
     repo.write("base.txt", "base\n");
     repo.commit("root commit");
-
     repo.create_with_gt("a feature", "a", "shared.txt", "a1\n");
     repo.create_with_gt("b feature", "b", "shared.txt", "a1\nb1\n");
-
+    let b_before = repo.git(&["rev-parse", "b"]);
     repo.git(&["switch", "-q", "a"]);
     repo.write("shared.txt", "A_AMENDED\n");
     repo.git(&["add", "shared.txt"]);
     repo.git(&["commit", "--amend", "--no-edit", "-q"]);
-
     repo.git(&["switch", "-q", "b"]);
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    (repo, git_dir, b_before)
+}
+
+#[test]
+fn restack_linear_pauses_natively_with_no_state_file() {
+    // A linear `gt restack` runs as one git-native `git rebase --update-refs`
+    // and keeps NO state file of its own: while paused, git's rebase is the
+    // single source of truth, so the desync that motivated this design can't
+    // arise. Resolving and `gt continue` finishes and refreshes fork points.
+    let (repo, git_dir, _) = linear_conflict_repo("restack-native-pause");
+
     let out = repo.gt("restack", "");
     assert!(!out.status.success(), "restack must pause on the conflict");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // The pause now steers the user toward gt, away from native git rebase.
-    assert!(
-        stdout.contains("not `git rebase --continue`"),
-        "the conflict message must warn against native git rebase; got:\n{stdout}"
-    );
-
-    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
     assert!(
         git_dir.join("rebase-merge").exists(),
-        "the pause must leave a live git rebase"
+        "the pause must leave a live git rebase for the user to resolve in"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "the git-native path must keep no resume state file of its own"
     );
 
-    // The user follows git's advice and ends the rebase out of band. Now git
-    // is no longer mid-rebase, but gt's state file remains: the reported
-    // desync.
-    repo.git(&["rebase", "--abort"]);
-    assert!(
-        !git_dir.join("rebase-merge").exists(),
-        "native abort must clear git's rebase state"
-    );
-    assert!(
-        git_dir.join("oh-my-gt").join("state.json").exists(),
-        "gt's state file outlives the rebase — the desync under test"
-    );
-
-    // A mutating command is still blocked, but the message must now explain the
-    // desync (clean `git status` vs gt's recorded op) rather than read as a bug.
-    let out = repo.gt("restack", "");
-    assert!(
-        !out.status.success(),
-        "a recorded op must still block restack"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("no longer in progress") && stderr.contains("git status"),
-        "the guard must explain the out-of-band end; got stderr:\n{stderr}"
-    );
-
-    // `gt continue` reconciles: it notes the out-of-band end and re-drives the
-    // plan. Because the user aborted, the rebase runs again and re-pauses on
-    // the same conflict — now back under gt's control.
-    let out = repo.gt("continue", "");
-    assert!(
-        !out.status.success(),
-        "continue must re-drive and re-pause on the still-unresolved conflict"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("ended outside gt"),
-        "continue must report that it is reconciling; got:\n{stdout}"
-    );
-    assert!(
-        git_dir.join("rebase-merge").exists(),
-        "reconciling must restore a live git rebase to resolve in"
-    );
-
-    // Resolve and finish through gt, as intended.
+    // Resolve and finish through gt.
     repo.write("shared.txt", "A_AMENDED\nb1\n");
     repo.git(&["add", "shared.txt"]);
     let out = repo.gt("continue", "");
     assert_success(&out, "gt continue after resolving");
-
     assert_eq!(
         repo.git(&["rev-parse", "b^"]),
         repo.git(&["rev-parse", "a"]),
@@ -1778,73 +1730,156 @@ fn restack_reconciles_when_user_ends_rebase_with_native_git() {
         "A_AMENDED\nb1",
         "b must carry the manually resolved content"
     );
+    // Metadata fork point was healed to a's new tip — b is no longer "needs
+    // restack" (a second restack is a no-op).
+    let out = repo.gt("restack", "");
+    assert_success(&out, "second restack");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("up to date"),
+        "fork points must be healed so the stack reads as up to date; got:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     assert!(
         !git_dir.join("rebase-merge").exists()
             && !git_dir.join("oh-my-gt").join("state.json").exists(),
-        "a clean finish must clear both git's rebase and gt's state file"
-    );
-    assert_eq!(
-        repo.git(&["symbolic-ref", "--short", "HEAD"]),
-        "b",
-        "continue must return to the original branch"
+        "a clean finish must leave no rebase and no state"
     );
 }
 
 #[test]
-fn abort_warns_when_rebase_was_ended_out_of_band() {
-    // Companion to the reconcile test: if the user finishes the rebase by hand
-    // and then runs `gt abort`, abort still restores the pre-operation state
-    // (its contract), but must say so rather than silently rewinding work the
-    // user just resolved.
-    let repo = TestRepo::new("abort-native-rebase-desync");
+fn native_git_rebase_abort_during_restack_leaves_no_gt_state() {
+    // The original report in one assertion: pause a restack, then end it with
+    // native `git rebase --abort` (exactly what `git status` tells you to do).
+    // Because the git-native path keeps no state file, git and gt agree
+    // afterward — no wedged "operation in progress" with a clean `git status`.
+    let (repo, git_dir, b_before) = linear_conflict_repo("restack-native-abort-clean");
+
+    let out = repo.gt("restack", "");
+    assert!(!out.status.success(), "restack must pause");
+
+    repo.git(&["rebase", "--abort"]);
+    assert!(
+        !git_dir.join("rebase-merge").exists(),
+        "native abort clears git's rebase state"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "and there is no gt state file left behind — the desync cannot occur"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "b"]),
+        b_before,
+        "native abort restores b to its pre-restack tip"
+    );
+
+    // gt is not wedged: a fresh restack just works (and re-pauses on the
+    // still-unresolved conflict).
+    let out = repo.gt("restack", "");
+    assert!(
+        !out.status.success() && git_dir.join("rebase-merge").exists(),
+        "restack must run again and re-pause, not refuse with a phantom op; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn restack_abort_is_git_native_and_undoes_the_rebase() {
+    // `gt abort` during a git-native restack is `git rebase --abort`: it undoes
+    // the in-flight rebase and restores the branch, with no state file involved.
+    let (repo, git_dir, b_before) = linear_conflict_repo("restack-native-gt-abort");
+
+    let out = repo.gt("restack", "");
+    assert!(!out.status.success(), "restack must pause");
+
+    let out = repo.gt("abort", "");
+    assert_success(&out, "gt abort");
+    assert!(
+        !git_dir.join("rebase-merge").exists()
+            && !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "abort must leave no rebase and no state"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "b"]),
+        b_before,
+        "abort must restore b to its pre-restack tip"
+    );
+}
+
+#[test]
+fn modify_reconciles_when_user_ends_rebase_with_native_git() {
+    // The state-backed engine (modify/move/sync, and DAG restacks) still pauses
+    // by leaving a live rebase alongside a state file. If the user ends that
+    // rebase out of band with native `git rebase`, the file outlives it and
+    // `git status` looks clean while gt still holds the op. gt must detect this
+    // and reconcile rather than wedge.
+    //
+    // main <- a <- b. `gt modify` on `a` amends it and restacks `b`; the amend
+    // collides with b's edit, so the restack of `b` pauses under the state
+    // engine (a multi-branch operation, unlike the linear git-native path).
+    let repo = TestRepo::new("modify-native-rebase-desync");
     repo.write("base.txt", "base\n");
     repo.commit("root commit");
 
     repo.create_with_gt("a feature", "a", "shared.txt", "a1\n");
     repo.create_with_gt("b feature", "b", "shared.txt", "a1\nb1\n");
-    let b_before = repo.git(&["rev-parse", "b"]);
 
     repo.git(&["switch", "-q", "a"]);
     repo.write("shared.txt", "A_AMENDED\n");
     repo.git(&["add", "shared.txt"]);
-    repo.git(&["commit", "--amend", "--no-edit", "-q"]);
-
-    repo.git(&["switch", "-q", "b"]);
-    let out = repo.gt("restack", "");
-    assert!(!out.status.success(), "restack must pause on the conflict");
-
-    // Resolve and finish the rebase with native git, leaving gt's state behind.
-    repo.write("shared.txt", "A_AMENDED\nb1\n");
-    repo.git(&["add", "shared.txt"]);
-    let cont = repo.git_allow_fail(&["rebase", "--continue"]);
-    assert!(
-        cont.status.success(),
-        "native rebase --continue should finish"
-    );
+    let out = repo.gt("modify", "");
+    assert!(!out.status.success(), "modify must pause restacking b");
 
     let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
     assert!(
-        !git_dir.join("rebase-merge").exists(),
-        "native continue must clear git's rebase state"
+        git_dir.join("oh-my-gt").join("state.json").exists(),
+        "the state engine must record the paused multi-branch op"
     );
 
-    let out = repo.gt("abort", "");
-    assert_success(&out, "gt abort");
+    // The user ends the rebase out of band. git is clean now; gt's file lingers.
+    repo.git(&["rebase", "--abort"]);
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "native abort must clear git's rebase state"
+    );
+    assert!(
+        git_dir.join("oh-my-gt").join("state.json").exists(),
+        "gt's state file outlives the rebase — the desync under test"
+    );
+
+    // The guard must explain the desync (clean `git status` vs gt's op).
+    let out = repo.gt("modify", "");
+    assert!(!out.status.success(), "a recorded op still blocks modify");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no longer in progress") && stderr.contains("git status"),
+        "the guard must explain the out-of-band end; got stderr:\n{stderr}"
+    );
+
+    // `gt continue` reconciles: notes the out-of-band end and re-drives, which
+    // re-pauses on the still-unresolved conflict — now back under gt.
+    let out = repo.gt("continue", "");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("ended outside gt"),
-        "abort must announce the out-of-band end; got:\n{stdout}"
+        "continue must report it is reconciling; got:\n{stdout}"
+    );
+    assert!(
+        git_dir.join("rebase-merge").exists(),
+        "reconciling must restore a live rebase to resolve in"
     );
 
-    // Abort still honors its contract: `b` is rewound to its pre-operation tip,
-    // and the operation state is cleared.
+    // Resolve and finish through gt.
+    repo.write("shared.txt", "A_AMENDED\nb1\n");
+    repo.git(&["add", "shared.txt"]);
+    let out = repo.gt("continue", "");
+    assert_success(&out, "gt continue after resolving");
     assert_eq!(
-        repo.git(&["rev-parse", "b"]),
-        b_before,
-        "abort must restore b to its pre-operation tip"
+        repo.git(&["rev-parse", "b^"]),
+        repo.git(&["rev-parse", "a"]),
+        "b must end up parented on the amended a"
     );
     assert!(
         !git_dir.join("oh-my-gt").join("state.json").exists(),
-        "abort must clear the state file"
+        "a clean finish must clear the state file"
     );
 }
