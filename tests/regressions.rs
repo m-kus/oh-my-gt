@@ -1883,3 +1883,284 @@ fn modify_reconciles_when_user_ends_rebase_with_native_git() {
         "a clean finish must clear the state file"
     );
 }
+
+/// Build the exact "stranded intermediate ref" desync from the bug report:
+///
+/// ```text
+///   main              (advanced past where the stack forked)
+///   └─ docker          new parent, off the advanced main
+///      └─ dvs          intermediate: metadata HEALED to claim it forked on
+///                      docker, but its ref was never moved off the old base
+///         └─ feat      tip: built on a *replay* of dvs's commit (parent
+///                      docker) that no branch points to
+/// ```
+///
+/// Both branches' fork points are internally consistent (each recorded
+/// revision equals its parent's tip), so the plain "fork point lags parent
+/// tip" check sees the stack as fully restacked — yet neither ref actually
+/// sits on its recorded parent. Returns `(repo, stranded_dvs_tip)`.
+fn stranded_intermediate_stack(name: &str) -> (TestRepo, String) {
+    let repo = TestRepo::new(name);
+    repo.write("base.txt", "base\n");
+    repo.commit("c0 old main");
+
+    // main <- dvs <- feat, all tracked through gt the ordinary way.
+    repo.create_with_gt("land ValidatorSet V1", "dvs", "dvs.txt", "v1\n");
+    let dvs_orig = repo.git(&["rev-parse", "dvs"]);
+    repo.create_with_gt("feat antithesis", "feat", "feat.txt", "f1\n");
+
+    // A new parent branch off an advanced main, brought into the stack as dvs's
+    // parent (PR #2234 in the report). gt records the relationship + fork point.
+    repo.git(&["switch", "-q", "main"]);
+    repo.write("base.txt", "base\nnewer\n");
+    repo.commit("newer main");
+    repo.create_with_gt("docker cli init", "docker", "docker.txt", "d\n");
+    let docker_tip = repo.git(&["rev-parse", "docker"]);
+
+    // The post-restack state the report describes: dvs's metadata is healed to
+    // claim it sits on docker, but its ref is left stranded on the old base.
+    // feat is rebuilt on a replay of dvs's commit (parent docker) — the commit
+    // that no branch points to — with its own fork point left at dvs's stranded
+    // tip, so every recorded fork point still matches its parent's tip.
+    repo.write_metadata("dvs", "docker", &docker_tip);
+    let dvs_tree = repo.git(&["rev-parse", "dvs^{tree}"]);
+    let replayed_dvs = repo.git(&[
+        "commit-tree",
+        &dvs_tree,
+        "-p",
+        &docker_tip,
+        "-m",
+        "land ValidatorSet V1",
+    ]);
+    let feat_tree = repo.git(&["rev-parse", "feat^{tree}"]);
+    let replayed_feat = repo.git(&[
+        "commit-tree",
+        &feat_tree,
+        "-p",
+        &replayed_dvs,
+        "-m",
+        "feat antithesis",
+    ]);
+    repo.git(&["update-ref", "refs/heads/feat", &replayed_feat]);
+    repo.write_metadata("feat", "dvs", &dvs_orig);
+
+    (repo, dvs_orig)
+}
+
+#[test]
+fn log_flags_a_stranded_intermediate_ref_whose_metadata_looks_consistent() {
+    // The silent half of the report: a restack moved the tip's ancestry onto a
+    // new base but left an intermediate ref behind, then healed every fork
+    // point so each recorded revision equals its parent's tip. A plain
+    // fork-point comparison reports the stack as consistent; `gt log` must
+    // instead flag any branch whose ref does not descend from its parent.
+    let (repo, dvs_orig) = stranded_intermediate_stack("restack-strand-detect");
+    repo.git(&["switch", "-q", "feat"]);
+
+    // Precondition: the metadata is internally consistent — dvs claims to fork
+    // exactly at docker's tip — so the desync is invisible to a fork-point check.
+    assert_eq!(
+        repo.git(&["cat-file", "-p", "refs/branch-metadata/dvs"]),
+        format!(
+            r#"{{"parentBranchName":"docker","parentBranchRevision":"{}"}}"#,
+            repo.git(&["rev-parse", "docker"])
+        ),
+        "dvs's recorded fork point must equal docker's tip (a consistent-looking lie)"
+    );
+    assert!(
+        repo.git_allow_fail(&["merge-base", "--is-ancestor", "docker", "dvs"])
+            .status
+            .code()
+            != Some(0),
+        "guard: dvs's ref must NOT actually descend from docker"
+    );
+
+    let out = repo.gt("log", "");
+    assert_success(&out, "gt log");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let dvs_line = stdout
+        .lines()
+        .find(|l| l.contains(" dvs "))
+        .unwrap_or_else(|| panic!("no dvs line in gt log:\n{stdout}"));
+    assert!(
+        dvs_line.contains("needs restack"),
+        "the stranded intermediate `dvs` must be flagged; got:\n{stdout}"
+    );
+    let feat_line = stdout
+        .lines()
+        .find(|l| l.contains(" feat "))
+        .unwrap_or_else(|| panic!("no feat line in gt log:\n{stdout}"));
+    assert!(
+        feat_line.contains("needs restack"),
+        "`feat`, built on a commit no branch points to, must be flagged; got:\n{stdout}"
+    );
+
+    // dvs's ref is still its stranded tip — `gt log` only reports, never moves.
+    assert_eq!(repo.git(&["rev-parse", "dvs"]), dvs_orig);
+}
+
+#[test]
+fn restack_does_not_falsely_claim_a_stranded_ref_was_restacked() {
+    // The other half: because the restack plan reads its `--onto` base from the
+    // (healed, lying) fork point, replaying the tip never moves the stranded
+    // intermediate. gt must not announce "restacked dvs" when the ref did not
+    // move — that is precisely how the desync stays silent. It reports the
+    // stranded branch instead, leaves its ref untouched (never lost), and keeps
+    // flagging it.
+    let (repo, dvs_orig) = stranded_intermediate_stack("restack-strand-honest");
+    repo.git(&["switch", "-q", "feat"]);
+
+    let out = repo.gt("restack", "");
+    assert_success(&out, "gt restack");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !stdout.contains("restacked dvs"),
+        "restack must not claim it restacked the ref it could not move; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dvs") && stdout.contains("stranded"),
+        "restack must report the stranded intermediate; got:\n{stdout}"
+    );
+
+    // Golden rule: the stranded ref is left exactly where it was, not lost.
+    assert_eq!(
+        repo.git(&["rev-parse", "dvs"]),
+        dvs_orig,
+        "the stranded ref must be left intact"
+    );
+
+    // And the desync is still surfaced afterward, not silently "healed".
+    let out = repo.gt("log", "");
+    assert_success(&out, "gt log after restack");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dvs_line = stdout.lines().find(|l| l.contains(" dvs ")).unwrap();
+    assert!(
+        dvs_line.contains("needs restack"),
+        "dvs must still be flagged after a restack that could not move it; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn abort_after_out_of_band_continue_leaves_no_phantom_changes() {
+    // The reported failure: a state-backed restack is finished out of band with
+    // native `git rebase --continue`, so HEAD ends on the rebased branch while
+    // gt's state file lingers. `gt abort` then rolls every branch back — and
+    // must not desync the checked-out one. Rolling its ref with `update-ref`
+    // while it is HEAD leaves the index and working tree on the rebased content
+    // (phantom staged changes that contradict the "restored" report) and
+    // strands the user on that branch instead of where they started.
+    let repo = TestRepo::new("abort-no-phantom-changes");
+    repo.write("shared.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("a feature", "a", "shared.txt", "a1\n");
+    repo.create_with_gt("b feature", "b", "shared.txt", "a1\nb1\n");
+    let b_before = repo.git(&["rev-parse", "b"]);
+
+    // Amend `a` so restacking `b` conflicts; `gt modify` pauses under the state
+    // engine with a live rebase on `b`.
+    repo.git(&["switch", "-q", "a"]);
+    repo.write("shared.txt", "A_AMENDED\n");
+    repo.git(&["add", "shared.txt"]);
+    let out = repo.gt("modify", "");
+    assert!(!out.status.success(), "modify must pause restacking b");
+
+    // Finish the rebase out of band with native git: HEAD lands on the rebased
+    // `b` and gt's state file is left behind.
+    repo.write("shared.txt", "A_AMENDED\nb1\n");
+    repo.git(&["add", "shared.txt"]);
+    repo.git(&["-c", "core.editor=true", "rebase", "--continue"]);
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("rebase-merge").exists()
+            && git_dir.join("oh-my-gt").join("state.json").exists(),
+        "setup: rebase ended out of band, HEAD on the rebased branch, state file present"
+    );
+    assert_eq!(
+        repo.current_branch(),
+        "b",
+        "setup: HEAD must be on the rebased branch"
+    );
+
+    let out = repo.gt("abort", "");
+    assert_success(&out, "gt abort");
+    assert_eq!(
+        repo.git(&["status", "--porcelain"]),
+        "",
+        "abort must leave a clean working tree, not phantom staged changes"
+    );
+    assert_eq!(
+        repo.current_branch(),
+        "a",
+        "abort must land on the branch the operation started from, not strand HEAD on `b`"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "b"]),
+        b_before,
+        "abort must roll `b` back to its pre-modify tip"
+    );
+}
+
+#[test]
+fn sync_skips_a_branch_checked_out_in_another_worktree() {
+    // The trigger from the report: a branch in the stack is checked out in a
+    // second worktree, so git refuses to rebase it. `gt sync` must skip it (and
+    // anything stacked on it) cleanly — restacking what it can, leaving no
+    // operation behind to abort — rather than failing with a cryptic git error.
+    let repo = TestRepo::new("sync-skip-occupied-worktree");
+    repo.add_origin();
+    repo.write("f.txt", "v0\n");
+    repo.commit("c0");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    // Stack main <- A <- B <- C; leave the primary worktree on C.
+    repo.create_with_gt("A feature", "A", "a.txt", "a\n");
+    repo.create_with_gt("B feature", "B", "b.txt", "b\n");
+    repo.create_with_gt("C feature", "C", "c.txt", "c\n");
+
+    // Occupy the intermediate `B` in a second worktree.
+    let b_wt = repo.root.join("b_wt");
+    repo.git(&["worktree", "add", "-q", b_wt.to_str().unwrap(), "B"]);
+
+    // Advance origin/main so sync wants to restack the whole stack.
+    advance_origin_main(&repo, "upstream commit", "f.txt", "v1\n");
+
+    let out = repo.gt("sync", "");
+    assert_success(&out, "gt sync with an occupied branch must not error");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("restacked A"),
+        "sync must still restack the branch it can; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("B") && stdout.contains("worktree"),
+        "sync must report `B` skipped as checked out in another worktree; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains('C') && stdout.contains("parent not restacked"),
+        "sync must skip `C`, which is stacked on the skipped `B`; got:\n{stdout}"
+    );
+
+    // No operation is left behind to clean up, and the primary worktree is clean
+    // and back on the branch the user started from.
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "a graceful skip must not leave a state file to abort"
+    );
+    assert_eq!(
+        repo.git(&["status", "--porcelain"]),
+        "",
+        "the primary worktree must stay clean"
+    );
+    assert_eq!(repo.current_branch(), "C", "sync must land back on C");
+
+    // The branch it could restack now sits on the advanced trunk; the occupied
+    // one and its descendant were left untouched.
+    assert_eq!(
+        repo.git(&["rev-parse", "A^"]),
+        repo.git(&["rev-parse", "main"]),
+        "A must be restacked onto the updated trunk"
+    );
+}

@@ -349,6 +349,15 @@ pub fn restack(roots: &[String], operation: &str) -> Result<()> {
 
 /// Begin executing a freshly-built plan.
 pub fn start(graph: &StackGraph, plan: RestackPlan) -> Result<()> {
+    // This engine pauses on the first conflict, so refuse up front if any
+    // branch it would rewrite is checked out in another worktree — git cannot
+    // touch such a ref, and erroring partway would leave a stranded operation.
+    let touched: Vec<String> = plan
+        .chains
+        .iter()
+        .flat_map(|c| c.branches.iter().cloned())
+        .collect();
+    ensure_no_occupied_branches(&touched)?;
     let st = prepare(graph, plan)?;
     state::save(&st)?;
     drive(st)
@@ -424,11 +433,7 @@ pub fn resume() -> Result<()> {
         if code != 0 {
             return handle_rebase_exit(&mut st, &gd, "");
         }
-        let chain = st.chains[st.current_chain].clone();
         finish_chain(&mut st)?;
-        for b in &chain.branches {
-            println!("restacked {}", style.branch(b));
-        }
     } else {
         // gt has a paused restack recorded, but git is not mid-rebase: the
         // rebase gt started was finished or aborted out of band with native
@@ -490,6 +495,22 @@ pub fn abort() -> Result<()> {
         );
     }
 
+    // Rolling a branch ref back with `update-ref` while it is the checked-out
+    // branch moves only the ref: the index and working tree stay on the old
+    // (rebased) content, surfacing as phantom staged changes that contradict
+    // the "restored" report and can derail the landing switch onto a stray
+    // branch. Detach HEAD first so no branch in this worktree is current while
+    // refs move, then reattach to the return branch below. Detaching leaves the
+    // working tree untouched, and the plain switches never discard work.
+    //
+    // A branch the operation rewrote is never one checked out in *another*
+    // worktree — a rebase cannot have touched a branch it could not check out —
+    // so rolling those refs back is a no-op and leaves the other worktree alone.
+    let was_on_branch = git::current_branch()?.is_some();
+    if was_on_branch {
+        git::run(&["switch", "--detach"])?;
+    }
+
     // Roll every touched branch back to its pre-operation tip and metadata.
     for s in &st.snapshot {
         git::run(&["update-ref", &git::head_ref(&s.branch), &s.tip])?;
@@ -500,15 +521,21 @@ pub fn abort() -> Result<()> {
     }
 
     state::clear()?;
-    println!("aborted; the stack was restored to its previous state");
 
-    // Best-effort return to the original branch. A plain (non-force) switch is
-    // used so it can never discard uncommitted work.
-    if let Some(rb) = &st.return_branch {
-        if git::branch_exists(rb)? {
-            let _ = git::run(&["switch", "--", rb]);
-        }
+    // Reattach to the return branch at its restored tip, bringing the working
+    // tree with it (the rollback above recreated it if the operation had deleted
+    // it). Fall back to trunk so a missing return branch never strands the user
+    // on a detached HEAD. A plain switch never discards uncommitted work.
+    let landing = match &st.return_branch {
+        Some(rb) if git::branch_exists(rb)? => Some(rb.clone()),
+        _ if was_on_branch => Some(st.trunk.clone()),
+        _ => None,
+    };
+    if let Some(branch) = landing {
+        git::run(&["switch", "--", &branch])?;
     }
+
+    println!("aborted; the stack was restored to its previous state");
     Ok(())
 }
 
@@ -533,7 +560,9 @@ pub fn restack_native(chain: Chain, current: &str) -> Result<()> {
             "a git rebase is already in progress".into(),
         ));
     }
-    let style = OutputStyle::stdout();
+    // `--update-refs` moves every ref on the chain; git refuses to touch one
+    // checked out in another worktree. Refuse up front rather than fail partway.
+    ensure_no_occupied_branches(&chain.branches)?;
     let new_base = git::branch_tip(&chain.parent)?;
     let out = git::run_allow_fail(&[
         "rebase",
@@ -561,9 +590,6 @@ pub fn restack_native(chain: Chain, current: &str) -> Result<()> {
         return Err(GtError::Paused);
     }
     write_chain_metadata(&chain)?;
-    for b in &chain.branches {
-        println!("restacked {}", style.branch(b));
-    }
     git::switch_if_exists(current)?;
     Ok(())
 }
@@ -694,6 +720,24 @@ fn drive_best_effort(mut st: OpState) -> Result<()> {
 
             st.current_chain = idx;
             let chain = st.chains[idx].clone();
+
+            // A branch checked out in another worktree can't be rebased — git
+            // refuses to touch it — so attempting it just fails with a cryptic
+            // error and leaves a half-finished run behind. Skip it (and anything
+            // stacked on it) cleanly instead, the same as an off-path conflict.
+            if let Some(path) = git::branch_occupied_elsewhere(chain.tip())? {
+                println!(
+                    "{} {} is checked out in another worktree ({}); skipping it and \
+                     anything stacked on it",
+                    style.warning("skipped:"),
+                    style.branch(chain.tip()),
+                    path.display()
+                );
+                abandon_chain_and_dependents(&mut st, idx, &style);
+                state::save(&st)?;
+                continue;
+            }
+
             let new_base = git::branch_tip(&chain.parent)?;
             let out = git::run_allow_fail(&[
                 "rebase",
@@ -708,9 +752,6 @@ fn drive_best_effort(mut st: OpState) -> Result<()> {
             ])?;
             if out.code == 0 {
                 finish_chain(&mut st)?;
-                for b in &chain.branches {
-                    println!("restacked {}", style.branch(b));
-                }
                 continue;
             }
 
@@ -743,12 +784,26 @@ fn drive_best_effort(mut st: OpState) -> Result<()> {
     Ok(())
 }
 
-/// Report a chain that cannot be restacked automatically and mark it — plus
-/// every chain stacked on it — as done so it is never retried this run.
+/// Refuse if any of `branches` is checked out in another worktree. git cannot
+/// rebase or move such a ref, so an operation that tried would fail partway and
+/// leave a stranded run; the strict engine reports it before touching anything.
+fn ensure_no_occupied_branches(branches: &[String]) -> Result<()> {
+    for b in branches {
+        if let Some(path) = git::branch_occupied_elsewhere(b)? {
+            return Err(GtError::Precondition(format!(
+                "`{b}` is checked out in another worktree ({}); close that worktree or check \
+                 the branch out there to restack it",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Report a chain that cannot be restacked automatically, then abandon it and
+/// everything stacked on it for this run.
 fn give_up_on_chain(st: &mut OpState, idx: usize, style: &OutputStyle) {
-    let mut given_up: HashSet<String> = HashSet::new();
     for b in &st.chains[idx].branches {
-        given_up.insert(b.clone());
         println!(
             "{} {} cannot be restacked automatically; check it out and run `gt restack` to \
              resolve manually",
@@ -756,9 +811,17 @@ fn give_up_on_chain(st: &mut OpState, idx: usize, style: &OutputStyle) {
             style.branch(b)
         );
     }
+    abandon_chain_and_dependents(st, idx, style);
+}
+
+/// Mark chain `idx` and every chain transitively stacked on it as done so they
+/// are not retried this run, reporting each dependent as skipped. The caller has
+/// already explained why chain `idx` itself was abandoned.
+fn abandon_chain_and_dependents(st: &mut OpState, idx: usize, style: &OutputStyle) {
+    let mut given_up: HashSet<String> = st.chains[idx].branches.iter().cloned().collect();
     st.chains[idx].done = true;
     // Chains are planned parent-first, so a single forward sweep reaches
-    // every chain transitively stacked on the conflicted one.
+    // every chain transitively stacked on the abandoned one.
     for chain in st.chains.iter_mut().skip(idx + 1) {
         if chain.done || !given_up.contains(&chain.parent) {
             continue;
@@ -775,10 +838,9 @@ fn give_up_on_chain(st: &mut OpState, idx: usize, style: &OutputStyle) {
     }
 }
 
-/// Run chains from `current_chain` onward, printing one status line per
-/// restacked branch. The raw `git rebase` output is captured, not shown.
+/// Run chains from `current_chain` onward; `write_chain_metadata` prints one
+/// status line per branch. The raw `git rebase` output is captured, not shown.
 fn drive(mut st: OpState) -> Result<()> {
-    let style = OutputStyle::stdout();
     while st.current_chain < st.chains.len() {
         if st.chains[st.current_chain].done {
             st.current_chain += 1;
@@ -803,17 +865,24 @@ fn drive(mut st: OpState) -> Result<()> {
             return handle_rebase_exit(&mut st, &gd, &out.stderr);
         }
         finish_chain(&mut st)?;
-        for b in &chain.branches {
-            println!("restacked {}", style.branch(b));
-        }
     }
     complete(st)
 }
 
 /// Refresh the recorded parent + fork point for each branch in a freshly
-/// rebased linear chain. Parent-most first: each branch's parent is the
-/// previous one in the chain (or the chain's own parent for the head).
+/// rebased linear chain, and report the per-branch outcome. Parent-most first:
+/// each branch's parent is the previous one in the chain (or the chain's own
+/// parent for the head).
+///
+/// `--update-refs` is expected to have moved every ref on the chain onto its
+/// parent. This verifies it actually did before healing metadata: a branch
+/// whose ref does not descend from its parent's new tip was left stranded off
+/// the rebased line, so recording its fork point as the parent tip would claim
+/// a restack that never moved the ref — the exact silent desync this engine
+/// exists to prevent. Such a branch is reported and its metadata left untouched,
+/// so `needs_restack` keeps flagging it rather than vouching for a bad ref.
 fn write_chain_metadata(chain: &Chain) -> Result<()> {
+    let style = OutputStyle::stdout();
     for (i, branch) in chain.branches.iter().enumerate() {
         let parent = if i == 0 {
             &chain.parent
@@ -821,10 +890,22 @@ fn write_chain_metadata(chain: &Chain) -> Result<()> {
             &chain.branches[i - 1]
         };
         let parent_tip = git::branch_tip(parent)?;
+        let branch_tip = git::branch_tip(branch)?;
+        if !git::is_ancestor(&parent_tip, &branch_tip)? {
+            println!(
+                "{} `{}` was not moved onto `{}`; its ref is stranded off the rebased \
+                 line and still needs a restack",
+                style.warning("warning:"),
+                branch,
+                parent
+            );
+            continue;
+        }
         let mut m = meta::read(branch)?.unwrap_or_default();
         m.parent_branch_name = Some(parent.clone());
         m.parent_branch_revision = Some(parent_tip);
         meta::write(branch, &m)?;
+        println!("restacked {}", style.branch(branch));
     }
     Ok(())
 }

@@ -209,7 +209,18 @@ impl StackGraph {
             .collect()
     }
 
-    /// Does this branch's recorded fork point lag behind its parent's tip?
+    /// Does this branch's recorded fork point lag behind its parent's tip, or
+    /// does its ref fail to actually sit on its parent?
+    ///
+    /// Two independent ways a branch can be out of date:
+    /// * the recorded fork point no longer matches the parent's tip (the
+    ///   parent advanced or was rewritten) — the cheap, common case; or
+    /// * the fork point *does* match, yet the branch's own ref does not descend
+    ///   from the parent's tip. That means the ref was stranded — left on its
+    ///   old base while its metadata was healed to claim a restack that never
+    ///   moved it (e.g. a rebase that replayed an intermediate's commit but only
+    ///   updated the tip ref). The metadata reads as consistent but the ref is
+    ///   not, so a plain fork-point comparison misses it; verify ancestry.
     pub fn needs_restack(&self, name: &str) -> bool {
         let Some(node) = self.nodes.get(name) else {
             return false;
@@ -223,10 +234,18 @@ impl StackGraph {
             .as_ref()
             .and_then(|m| m.parent_branch_revision.as_deref());
         let parent_tip = self.nodes.get(parent).map(|p| p.tip.as_str());
-        match (recorded, parent_tip) {
-            (Some(r), Some(t)) => r != t,
-            _ => true,
+        let (recorded, parent_tip) = match (recorded, parent_tip) {
+            (Some(r), Some(t)) => (r, t),
+            _ => return true,
+        };
+        if recorded != parent_tip {
+            return true;
         }
+        // Fork point matches, so the metadata looks restacked. Confirm the ref
+        // genuinely descends from the parent; a stranded ref does not. On the
+        // off chance git can't answer, flag it rather than vouch for the ref —
+        // a spurious marker is harmless, a hidden desync is the bug we're after.
+        !git::is_ancestor(parent_tip, &node.tip).unwrap_or(false)
     }
 
     /// Self + all descendants, parents before children (topological).

@@ -290,6 +290,19 @@ pub fn worktree_owner_of(branch: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// If `branch` is checked out in a worktree *other* than the current one,
+/// return that worktree's path. A branch checked out elsewhere cannot be
+/// rebased or switched to (`git` refuses, e.g. `'B' is already used by worktree
+/// at ...`), so callers skip it rather than fail mid-operation.
+pub fn branch_occupied_elsewhere(branch: &str) -> Result<Option<PathBuf>> {
+    let Some(owner) = worktree_owner_of(branch)? else {
+        return Ok(None);
+    };
+    let here = PathBuf::from(run(&["rev-parse", "--show-toplevel"])?);
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    Ok((canon(&owner) != canon(&here)).then_some(owner))
+}
+
 /// Whether the working tree rooted at `worktree` is clean.
 pub fn is_clean_in(worktree: &Path) -> Result<bool> {
     let path = worktree
