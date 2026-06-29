@@ -349,6 +349,16 @@ pub fn restack(roots: &[String], operation: &str) -> Result<()> {
 
 /// Begin executing a freshly-built plan.
 pub fn start(graph: &StackGraph, plan: RestackPlan) -> Result<()> {
+    // This engine pauses on the first conflict, so refuse up front if any
+    // branch it would rewrite is checked out in another worktree — git cannot
+    // touch such a ref, and erroring partway would leave a stranded operation.
+    let touched: Vec<String> = plan
+        .chains
+        .iter()
+        .flat_map(|c| c.branches.iter().cloned())
+        .collect();
+    ensure_no_occupied_branches(&touched)?;
+    ensure_no_grafted_branches(&touched, &graph.shallow)?;
     let st = prepare(graph, plan)?;
     state::save(&st)?;
     drive(st)
@@ -398,10 +408,22 @@ fn prepare(graph: &StackGraph, plan: RestackPlan) -> Result<OpState> {
 
 /// Resume an operation paused on conflicts (`gt continue`).
 pub fn resume() -> Result<()> {
-    let mut st = state::load()?
-        .ok_or_else(|| GtError::Usage("no operation in progress to continue".into()))?;
-
     let gd = git::git_dir()?;
+    let style = OutputStyle::stdout();
+
+    let Some(mut st) = state::load()? else {
+        // No multi-step operation is recorded. A live git rebase here belongs
+        // to a git-native restack (see [`restack_native`]), which keeps no
+        // state file of its own — git's rebase is the single source of truth.
+        // Drive it through git and then refresh the stack's fork points.
+        if git::rebase_in_progress(&gd) {
+            return resume_native(&style);
+        }
+        return Err(GtError::Usage(
+            "no operation in progress to continue".into(),
+        ));
+    };
+
     if git::rebase_in_progress(&gd) {
         if !git::conflicted_files()?.is_empty() {
             return Err(GtError::Precondition(
@@ -412,12 +434,28 @@ pub fn resume() -> Result<()> {
         if code != 0 {
             return handle_rebase_exit(&mut st, &gd, "");
         }
-        let chain = st.chains[st.current_chain].clone();
         finish_chain(&mut st)?;
-        let style = OutputStyle::stdout();
-        for b in &chain.branches {
-            println!("restacked {}", style.branch(b));
+    } else {
+        // gt has a paused restack recorded, but git is not mid-rebase: the
+        // rebase gt started was finished or aborted out of band with native
+        // `git rebase` commands. Re-driving the plan from the current branch
+        // tips reconciles either case — a chain the user already replayed
+        // becomes a no-op (its commits are dropped as empty), and one they
+        // undid simply runs again. But only when the tree is clean: a stray
+        // change would otherwise be lost to, or block, the replay.
+        if git::is_dirty()? {
+            return Err(GtError::Precondition(
+                "the rebase gt paused is no longer in progress, and the working tree has \
+                 uncommitted changes. Commit or stash them, then run `gt continue` — or run \
+                 `gt abort` to discard the in-progress restack."
+                    .into(),
+            ));
         }
+        println!(
+            "{} the git rebase ended outside gt (with native `git rebase`); reconciling and \
+             continuing the restack",
+            style.warning("note:")
+        );
     }
     if st.best_effort {
         drive_best_effort(st)
@@ -428,11 +466,50 @@ pub fn resume() -> Result<()> {
 
 /// Abort an in-progress operation (`gt abort`), restoring the prior state.
 pub fn abort() -> Result<()> {
-    let st =
-        state::load()?.ok_or_else(|| GtError::Usage("no operation in progress to abort".into()))?;
+    let style = OutputStyle::stdout();
+
+    let Some(st) = state::load()? else {
+        // No multi-step operation recorded. A live git rebase belongs to a
+        // git-native restack; abort it through git, which reverts the refs it
+        // moved via --update-refs. Nothing else to roll back.
+        if git::rebase_in_progress(&git::git_dir()?) {
+            git::run(&["rebase", "--abort"])?;
+            println!("aborted; the rebase was undone");
+            return Ok(());
+        }
+        return Err(GtError::Usage("no operation in progress to abort".into()));
+    };
 
     if git::rebase_in_progress(&git::git_dir()?) {
         git::run(&["rebase", "--abort"])?;
+    } else {
+        // The rebase gt paused is already gone — finished or aborted out of
+        // band with native `git rebase`. We still roll the recorded branches
+        // back to their pre-operation tips (that is what `abort` promises),
+        // but say so: if the user resolved the rebase by hand, this rewinds
+        // that result. The rewound commits stay reachable through git's reflog,
+        // so this is recoverable, not destructive.
+        println!(
+            "{} no git rebase is in progress (it was ended outside gt); restoring the \
+             pre-operation state anyway",
+            style.warning("note:")
+        );
+    }
+
+    // Rolling a branch ref back with `update-ref` while it is the checked-out
+    // branch moves only the ref: the index and working tree stay on the old
+    // (rebased) content, surfacing as phantom staged changes that contradict
+    // the "restored" report and can derail the landing switch onto a stray
+    // branch. Detach HEAD first so no branch in this worktree is current while
+    // refs move, then reattach to the return branch below. Detaching leaves the
+    // working tree untouched, and the plain switches never discard work.
+    //
+    // A branch the operation rewrote is never one checked out in *another*
+    // worktree — a rebase cannot have touched a branch it could not check out —
+    // so rolling those refs back is a no-op and leaves the other worktree alone.
+    let was_on_branch = git::current_branch()?.is_some();
+    if was_on_branch {
+        git::run(&["switch", "--detach"])?;
     }
 
     // Roll every touched branch back to its pre-operation tip and metadata.
@@ -445,16 +522,203 @@ pub fn abort() -> Result<()> {
     }
 
     state::clear()?;
-    println!("aborted; the stack was restored to its previous state");
 
-    // Best-effort return to the original branch. A plain (non-force) switch is
-    // used so it can never discard uncommitted work.
-    if let Some(rb) = &st.return_branch {
-        if git::branch_exists(rb)? {
-            let _ = git::run(&["switch", "--", rb]);
+    // Reattach to the return branch at its restored tip, bringing the working
+    // tree with it (the rollback above recreated it if the operation had deleted
+    // it). Fall back to trunk so a missing return branch never strands the user
+    // on a detached HEAD. A plain switch never discards uncommitted work.
+    let landing = match &st.return_branch {
+        Some(rb) if git::branch_exists(rb)? => Some(rb.clone()),
+        _ if was_on_branch => Some(st.trunk.clone()),
+        _ => None,
+    };
+    if let Some(branch) = landing {
+        git::run(&["switch", "--", &branch])?;
+    }
+
+    println!("aborted; the stack was restored to its previous state");
+    Ok(())
+}
+
+/// Restack a single linear chain as one `git rebase --update-refs`, keeping no
+/// resume state of its own.
+///
+/// `--update-refs` moves every branch ref on the chain in one pass, so once the
+/// rebase starts there is no "remaining plan" to remember — git's own todo
+/// holds it. While a conflict is being resolved, git's rebase state is the
+/// single source of truth, so `git status` and gt can never disagree (the whole
+/// point: it removes the desync class of bug). `gt continue` / `gt abort` then
+/// drive the live rebase directly, and so do native `git rebase --continue` /
+/// `--abort`. Metadata is written only on a clean finish, so an abort — by gt
+/// or by git — needs nothing rolled back beyond the refs git itself restores.
+///
+/// Used by `gt restack` for the common case of a linear current stack; DAG or
+/// multi-segment restacks still go through the state-backed engine.
+pub fn restack_native(chain: Chain, current: &str) -> Result<()> {
+    git::ensure_clean()?;
+    if git::rebase_in_progress(&git::git_dir()?) {
+        return Err(GtError::Precondition(
+            "a git rebase is already in progress".into(),
+        ));
+    }
+    // `--update-refs` moves every ref on the chain; git refuses to touch one
+    // checked out in another worktree. Refuse up front rather than fail partway.
+    ensure_no_occupied_branches(&chain.branches)?;
+    // A grafted (shallow-boundary) branch makes `--update-refs` write a corrupt
+    // `update-ref grafted` todo and strand the rebase; refuse before starting.
+    ensure_no_grafted_branches(&chain.branches, &git::shallow_boundaries()?)?;
+    let new_base = git::branch_tip(&chain.parent)?;
+    let out = git::run_allow_fail(&[
+        "rebase",
+        "--update-refs",
+        "--committer-date-is-author-date",
+        "--empty=drop",
+        "--onto",
+        &new_base,
+        &chain.old_base,
+        "--",
+        chain.tip(),
+    ])?;
+    if out.code != 0 {
+        if !git::rebase_in_progress(&git::git_dir()?) {
+            let detail = if out.stderr.is_empty() {
+                String::new()
+            } else {
+                format!(":\n{}", out.stderr)
+            };
+            return Err(GtError::Git(format!(
+                "git rebase failed unexpectedly{detail}"
+            )));
+        }
+        print_conflict_pause(Some(chain.tip()));
+        return Err(GtError::Paused);
+    }
+    write_chain_metadata(&chain)?;
+    git::switch_if_exists(current)?;
+    Ok(())
+}
+
+/// Continue a git-native restack (no state file): finish the live rebase, then
+/// refresh the current stack's fork points so they match the replay.
+fn resume_native(style: &OutputStyle) -> Result<()> {
+    if !git::conflicted_files()?.is_empty() {
+        return Err(GtError::Precondition(
+            "unresolved conflicts remain; resolve them and `git add` the files".into(),
+        ));
+    }
+    let code = git::run_interactive(&["rebase", "--continue"])?;
+    if code != 0 {
+        // Another commit in the chain conflicts; the rebase is still live.
+        print_conflict_pause(None);
+        return Err(GtError::Paused);
+    }
+    // The rebase finished and HEAD is on the rebased branch. Heal the recorded
+    // fork points for the stack it belongs to and report what moved.
+    if let Some(cur) = git::current_branch()? {
+        for b in heal_stack_metadata(&cur)? {
+            println!("restacked {}", style.branch(&b));
         }
     }
     Ok(())
+}
+
+/// After a git-native rebase finishes, refresh `parent_branch_revision` for
+/// every branch in `current`'s stack that now sits on its parent. Returns the
+/// branches whose metadata changed (i.e. those actually restacked).
+///
+/// A branch left stranded off the replayed line — its ref not descending from
+/// its parent — is rescued when it lies on `current`'s path: an external rebase
+/// commonly replays such a branch's change into `current`'s history without
+/// moving the branch's own ref, so we relocate it onto that equivalent commit
+/// (see [`relocate_stranded`]). Off-path strands (whose commits are not in
+/// `current`'s history) and ones with no equivalent are left for their own
+/// restack. Parent tips are read live, so a relocation is visible to children.
+fn heal_stack_metadata(current: &str) -> Result<Vec<String>> {
+    let style = OutputStyle::stdout();
+    let graph = StackGraph::load()?;
+    let on_path: HashSet<String> = graph.path_from_trunk(current).into_iter().collect();
+    let mut changed = Vec::new();
+    for branch in graph.stack_of(current) {
+        if graph.is_trunk(&branch) {
+            continue;
+        }
+        let Some(node) = graph.get(&branch) else {
+            continue;
+        };
+        let Some(parent) = node.parent.as_deref() else {
+            continue;
+        };
+        if !graph.nodes.contains_key(parent) {
+            continue;
+        }
+        // Read the parent's tip live: an earlier relocation in this loop may
+        // have moved it, and children must see the new position.
+        let parent_tip = git::branch_tip(parent)?;
+        let branch_tip = git::branch_tip(&branch)?;
+        let mut relocated = false;
+        if !git::is_ancestor(&parent_tip, &branch_tip)? {
+            // Only an on-path branch (not `current` itself) has its replayed
+            // commit in `current`'s history to relocate onto.
+            if !(on_path.contains(&branch) && branch != current) {
+                continue;
+            }
+            match relocate_stranded(&branch, &branch_tip, &parent_tip, current)? {
+                Relocation::Moved { from } => {
+                    println!(
+                        "re-pointed {} ({}) onto `{}` (equivalent commit from the rebase)",
+                        style.branch(&branch),
+                        &from[..from.len().min(8)],
+                        parent
+                    );
+                    relocated = true;
+                }
+                _ => continue,
+            }
+        }
+        let already_recorded = node.meta.as_ref().is_some_and(|m| {
+            m.parent_branch_name.as_deref() == Some(parent)
+                && m.parent_branch_revision.as_deref() == Some(parent_tip.as_str())
+        });
+        if already_recorded && !relocated {
+            continue;
+        }
+        let mut m = node.meta.clone().unwrap_or_default();
+        m.parent_branch_name = Some(parent.to_string());
+        m.parent_branch_revision = Some(parent_tip);
+        meta::write(&branch, &m)?;
+        // A relocation already reported itself; only fold genuine restacks into
+        // the list `resume_native` prints as "restacked".
+        if !relocated {
+            changed.push(branch);
+        }
+    }
+    Ok(changed)
+}
+
+/// Print conflict-pause guidance for a git-native restack. Unlike the
+/// state-backed path, native `git rebase --continue` / `--abort` are safe here
+/// (git owns all the state), so we don't warn against them — but we recommend
+/// `gt continue`, which also refreshes the recorded fork points afterward.
+fn print_conflict_pause(branch: Option<&str>) {
+    let style = OutputStyle::stdout();
+    println!();
+    match branch {
+        Some(b) => println!(
+            "{} `{}` cannot be restacked automatically",
+            style.warning("conflict:"),
+            b
+        ),
+        None => println!("{} unresolved conflicts remain", style.warning("conflict:")),
+    }
+    let files = git::conflicted_files().unwrap_or_default();
+    if !files.is_empty() {
+        println!("conflicted files:");
+        for f in &files {
+            println!("  {f}");
+        }
+    }
+    println!("resolve the conflicts, `git add` them, then run `gt continue` to finish");
+    println!("or run `gt abort` to undo the rebase");
 }
 
 // ── internals ───────────────────────────────────────────────────────────────
@@ -471,6 +735,10 @@ pub fn abort() -> Result<()> {
 ///   (`gt continue` / `gt abort`), exactly like [`drive`].
 fn drive_best_effort(mut st: OpState) -> Result<()> {
     let style = OutputStyle::stdout();
+    // Branches on a shallow-clone graft boundary can't be rebased (see
+    // [`ensure_no_grafted_branches`]); best-effort skips them and their
+    // dependents rather than aborting the whole pass, like an off-path conflict.
+    let shallow = git::shallow_boundaries()?;
     loop {
         let mut all_done = true;
         for idx in 0..st.chains.len() {
@@ -492,6 +760,43 @@ fn drive_best_effort(mut st: OpState) -> Result<()> {
 
             st.current_chain = idx;
             let chain = st.chains[idx].clone();
+
+            // A branch on a shallow graft boundary can't be rebased without
+            // corrupting the rebase (a bogus `update-ref grafted` todo). Skip
+            // the chain and anything stacked on it, pointing at the fix.
+            if let Some(grafted) = chain.branches.iter().find(|b| {
+                git::branch_tip(b)
+                    .map(|tip| shallow.contains(&tip))
+                    .unwrap_or(false)
+            }) {
+                println!(
+                    "{} {} sits on a shallow clone's graft boundary; run `git fetch --unshallow` \
+                     to restack it. Skipping it and anything stacked on it",
+                    style.warning("skipped:"),
+                    style.branch(grafted)
+                );
+                abandon_chain_and_dependents(&mut st, idx, &style);
+                state::save(&st)?;
+                continue;
+            }
+
+            // A branch checked out in another worktree can't be rebased — git
+            // refuses to touch it — so attempting it just fails with a cryptic
+            // error and leaves a half-finished run behind. Skip it (and anything
+            // stacked on it) cleanly instead, the same as an off-path conflict.
+            if let Some(path) = git::branch_occupied_elsewhere(chain.tip())? {
+                println!(
+                    "{} {} is checked out in another worktree ({}); skipping it and \
+                     anything stacked on it",
+                    style.warning("skipped:"),
+                    style.branch(chain.tip()),
+                    path.display()
+                );
+                abandon_chain_and_dependents(&mut st, idx, &style);
+                state::save(&st)?;
+                continue;
+            }
+
             let new_base = git::branch_tip(&chain.parent)?;
             let out = git::run_allow_fail(&[
                 "rebase",
@@ -506,9 +811,6 @@ fn drive_best_effort(mut st: OpState) -> Result<()> {
             ])?;
             if out.code == 0 {
                 finish_chain(&mut st)?;
-                for b in &chain.branches {
-                    println!("restacked {}", style.branch(b));
-                }
                 continue;
             }
 
@@ -541,12 +843,47 @@ fn drive_best_effort(mut st: OpState) -> Result<()> {
     Ok(())
 }
 
-/// Report a chain that cannot be restacked automatically and mark it — plus
-/// every chain stacked on it — as done so it is never retried this run.
+/// Refuse if any of `branches` is checked out in another worktree. git cannot
+/// rebase or move such a ref, so an operation that tried would fail partway and
+/// leave a stranded run; the strict engine reports it before touching anything.
+fn ensure_no_occupied_branches(branches: &[String]) -> Result<()> {
+    for b in branches {
+        if let Some(path) = git::branch_occupied_elsewhere(b)? {
+            return Err(GtError::Precondition(format!(
+                "`{b}` is checked out in another worktree ({}); close that worktree or check \
+                 the branch out there to restack it",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse if any of `branches` sits on a shallow-clone graft boundary. git
+/// hides such a commit's real parents, so `rebase --update-refs` replaying one
+/// emits a corrupt `update-ref grafted` todo that strands the rebase, and every
+/// ancestry check around it lies. Deepening the clone is the only safe fix.
+fn ensure_no_grafted_branches(branches: &[String], shallow: &HashSet<String>) -> Result<()> {
+    if shallow.is_empty() {
+        return Ok(());
+    }
+    for b in branches {
+        let tip = git::branch_tip(b)?;
+        if shallow.contains(&tip) {
+            return Err(GtError::Precondition(format!(
+                "`{b}` sits on a shallow clone's graft boundary, so git cannot see its history \
+                 and gt cannot rebase it safely. Run `git fetch --unshallow` (or deepen the \
+                 clone enough to cover it) first"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Report a chain that cannot be restacked automatically, then abandon it and
+/// everything stacked on it for this run.
 fn give_up_on_chain(st: &mut OpState, idx: usize, style: &OutputStyle) {
-    let mut given_up: HashSet<String> = HashSet::new();
     for b in &st.chains[idx].branches {
-        given_up.insert(b.clone());
         println!(
             "{} {} cannot be restacked automatically; check it out and run `gt restack` to \
              resolve manually",
@@ -554,9 +891,17 @@ fn give_up_on_chain(st: &mut OpState, idx: usize, style: &OutputStyle) {
             style.branch(b)
         );
     }
+    abandon_chain_and_dependents(st, idx, style);
+}
+
+/// Mark chain `idx` and every chain transitively stacked on it as done so they
+/// are not retried this run, reporting each dependent as skipped. The caller has
+/// already explained why chain `idx` itself was abandoned.
+fn abandon_chain_and_dependents(st: &mut OpState, idx: usize, style: &OutputStyle) {
+    let mut given_up: HashSet<String> = st.chains[idx].branches.iter().cloned().collect();
     st.chains[idx].done = true;
     // Chains are planned parent-first, so a single forward sweep reaches
-    // every chain transitively stacked on the conflicted one.
+    // every chain transitively stacked on the abandoned one.
     for chain in st.chains.iter_mut().skip(idx + 1) {
         if chain.done || !given_up.contains(&chain.parent) {
             continue;
@@ -573,10 +918,9 @@ fn give_up_on_chain(st: &mut OpState, idx: usize, style: &OutputStyle) {
     }
 }
 
-/// Run chains from `current_chain` onward, printing one status line per
-/// restacked branch. The raw `git rebase` output is captured, not shown.
+/// Run chains from `current_chain` onward; `write_chain_metadata` prints one
+/// status line per branch. The raw `git rebase` output is captured, not shown.
 fn drive(mut st: OpState) -> Result<()> {
-    let style = OutputStyle::stdout();
     while st.current_chain < st.chains.len() {
         if st.chains[st.current_chain].done {
             st.current_chain += 1;
@@ -601,17 +945,80 @@ fn drive(mut st: OpState) -> Result<()> {
             return handle_rebase_exit(&mut st, &gd, &out.stderr);
         }
         finish_chain(&mut st)?;
-        for b in &chain.branches {
-            println!("restacked {}", style.branch(b));
-        }
     }
     complete(st)
 }
 
-/// Refresh metadata for the just-rebased chain and advance the cursor.
-fn finish_chain(st: &mut OpState) -> Result<()> {
-    let idx = st.current_chain;
-    let chain = st.chains[idx].clone();
+/// Outcome of trying to rescue a stranded branch ref by relocating it onto the
+/// commit an external/partial rebase already replayed it as.
+enum Relocation {
+    /// A unique equivalent commit was found and the ref was moved there.
+    Moved { from: String },
+    /// No equivalent commit exists on the rebased line — a genuine divergence
+    /// that needs a real rebase / manual resolution.
+    NoMatch,
+    /// More than one equivalent commit on the rebased line; gt won't guess.
+    Ambiguous(usize),
+}
+
+/// Try to move a stranded `branch` (whose ref, currently `branch_tip`, does not
+/// descend from its reconciled `parent_tip`) onto the commit that
+/// `descendant`'s history already holds for it.
+///
+/// A partial or external `git rebase` can replay a branch's change onto the new
+/// base — leaving an equivalent commit in a descendant's history — yet not move
+/// the branch's own ref (e.g. a rebase without `--update-refs`, or one whose
+/// `update-ref` line was dropped). The replayed commit shares the stranded tip's
+/// **patch-id**, the same equivalence git uses to detect already-applied
+/// commits, so we can find it and re-point the ref. Candidates are taken from
+/// `parent_tip..descendant`, which guarantees any match descends from the parent
+/// (so the move actually fixes the strand). Only a unique match is applied; zero
+/// or several are reported for the caller to surface.
+fn relocate_stranded(
+    branch: &str,
+    branch_tip: &str,
+    parent_tip: &str,
+    descendant: &str,
+) -> Result<Relocation> {
+    // git refuses to move a ref checked out in another worktree; don't try.
+    if git::branch_occupied_elsewhere(branch)?.is_some() {
+        return Ok(Relocation::NoMatch);
+    }
+    let Some(target) = git::patch_id(branch_tip)? else {
+        return Ok(Relocation::NoMatch);
+    };
+    let matches: Vec<String> = git::patch_ids_in_range(parent_tip, descendant)?
+        .into_iter()
+        .filter(|(pid, sha)| *pid == target && sha != branch_tip)
+        .map(|(_, sha)| sha)
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(Relocation::NoMatch),
+        [target_sha] => {
+            git::run(&["update-ref", &git::head_ref(branch), target_sha])?;
+            Ok(Relocation::Moved {
+                from: branch_tip.to_string(),
+            })
+        }
+        many => Ok(Relocation::Ambiguous(many.len())),
+    }
+}
+
+/// Refresh the recorded parent + fork point for each branch in a freshly
+/// rebased linear chain, and report the per-branch outcome. Parent-most first:
+/// each branch's parent is the previous one in the chain (or the chain's own
+/// parent for the head).
+///
+/// `--update-refs` is expected to have moved every ref on the chain onto its
+/// parent. This verifies it actually did before healing metadata: a branch
+/// whose ref does not descend from its parent's new tip was left stranded off
+/// the rebased line, so recording its fork point as the parent tip would claim
+/// a restack that never moved the ref — the exact silent desync this engine
+/// exists to prevent. Before giving up on such a branch we try to relocate it
+/// onto the equivalent commit the rebase already produced (see
+/// [`relocate_stranded`]); only a strand with no equivalent is left flagged.
+fn write_chain_metadata(chain: &Chain) -> Result<()> {
+    let style = OutputStyle::stdout();
     for (i, branch) in chain.branches.iter().enumerate() {
         let parent = if i == 0 {
             &chain.parent
@@ -619,11 +1026,55 @@ fn finish_chain(st: &mut OpState) -> Result<()> {
             &chain.branches[i - 1]
         };
         let parent_tip = git::branch_tip(parent)?;
+        let branch_tip = git::branch_tip(branch)?;
+        let mut relocated_from: Option<String> = None;
+        if !git::is_ancestor(&parent_tip, &branch_tip)? {
+            match relocate_stranded(branch, &branch_tip, &parent_tip, chain.tip())? {
+                Relocation::Moved { from } => relocated_from = Some(from),
+                Relocation::Ambiguous(n) => {
+                    println!(
+                        "{} `{}` is stranded and matches {n} equivalent commits on the rebased \
+                         line; re-point it by hand (`git branch -f {} <sha>`)",
+                        style.warning("warning:"),
+                        branch,
+                        branch
+                    );
+                    continue;
+                }
+                Relocation::NoMatch => {
+                    println!(
+                        "{} `{}` was not moved onto `{}`; its ref is stranded off the rebased \
+                         line and still needs a restack",
+                        style.warning("warning:"),
+                        branch,
+                        parent
+                    );
+                    continue;
+                }
+            }
+        }
         let mut m = meta::read(branch)?.unwrap_or_default();
         m.parent_branch_name = Some(parent.clone());
         m.parent_branch_revision = Some(parent_tip);
         meta::write(branch, &m)?;
+        match relocated_from {
+            Some(from) => println!(
+                "re-pointed {} ({}) onto `{}` and restacked (equivalent commit from the rebase)",
+                style.branch(branch),
+                &from[..from.len().min(8)],
+                parent
+            ),
+            None => println!("restacked {}", style.branch(branch)),
+        }
     }
+    Ok(())
+}
+
+/// Refresh metadata for the just-rebased chain and advance the cursor.
+fn finish_chain(st: &mut OpState) -> Result<()> {
+    let idx = st.current_chain;
+    let chain = st.chains[idx].clone();
+    write_chain_metadata(&chain)?;
     st.chains[idx].done = true;
     st.current_chain = idx + 1;
     state::save(st)?;
@@ -659,6 +1110,11 @@ fn handle_rebase_exit(st: &mut OpState, git_dir: &Path, detail: &str) -> Result<
     }
     println!("resolve the conflicts manually, `git add` them, then run `gt continue`");
     println!("or run `gt abort` to undo the rebase and restore the previous state");
+    println!(
+        "{} drive this with gt, not `git rebase --continue` / `git rebase --abort` — \
+         resolving the rebase with git directly leaves gt out of sync",
+        style.warning("note:")
+    );
     Err(GtError::Paused)
 }
 

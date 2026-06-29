@@ -257,6 +257,15 @@ impl TestRepo {
         self.git(&["rev-parse", "HEAD"])
     }
 
+    /// Mark `sha` as a shallow-clone graft boundary by writing it to
+    /// `.git/shallow`, reproducing a branch fetched as a single shallow commit:
+    /// git then hides its real parents (presents it as parentless) even though
+    /// the objects are present, exactly as a stale graft after later fetches.
+    fn graft(&self, sha: &str) {
+        let git_dir = PathBuf::from(self.git(&["rev-parse", "--absolute-git-dir"]));
+        fs::write(git_dir.join("shallow"), format!("{sha}\n")).unwrap();
+    }
+
     fn current_branch(&self) -> String {
         self.git(&["symbolic-ref", "--short", "HEAD"])
     }
@@ -1675,5 +1684,773 @@ fn sync_skips_stale_upstream_branches_not_on_current_path() {
     assert!(
         repo.git(&["status", "--porcelain"]).is_empty(),
         "sync must leave a clean working tree"
+    );
+}
+
+/// Build `main <- a <- b` (linear), then amend `a` so replaying b's commit
+/// conflicts. Leaves HEAD on `b`. Returns (repo, git_dir, b's pre-restack tip).
+fn linear_conflict_repo(name: &str) -> (TestRepo, PathBuf, String) {
+    let repo = TestRepo::new(name);
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("a feature", "a", "shared.txt", "a1\n");
+    repo.create_with_gt("b feature", "b", "shared.txt", "a1\nb1\n");
+    let b_before = repo.git(&["rev-parse", "b"]);
+    repo.git(&["switch", "-q", "a"]);
+    repo.write("shared.txt", "A_AMENDED\n");
+    repo.git(&["add", "shared.txt"]);
+    repo.git(&["commit", "--amend", "--no-edit", "-q"]);
+    repo.git(&["switch", "-q", "b"]);
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    (repo, git_dir, b_before)
+}
+
+#[test]
+fn restack_linear_pauses_natively_with_no_state_file() {
+    // A linear `gt restack` runs as one git-native `git rebase --update-refs`
+    // and keeps NO state file of its own: while paused, git's rebase is the
+    // single source of truth, so the desync that motivated this design can't
+    // arise. Resolving and `gt continue` finishes and refreshes fork points.
+    let (repo, git_dir, _) = linear_conflict_repo("restack-native-pause");
+
+    let out = repo.gt("restack", "");
+    assert!(!out.status.success(), "restack must pause on the conflict");
+    assert!(
+        git_dir.join("rebase-merge").exists(),
+        "the pause must leave a live git rebase for the user to resolve in"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "the git-native path must keep no resume state file of its own"
+    );
+
+    // Resolve and finish through gt.
+    repo.write("shared.txt", "A_AMENDED\nb1\n");
+    repo.git(&["add", "shared.txt"]);
+    let out = repo.gt("continue", "");
+    assert_success(&out, "gt continue after resolving");
+    assert_eq!(
+        repo.git(&["rev-parse", "b^"]),
+        repo.git(&["rev-parse", "a"]),
+        "b must end up parented on the amended a"
+    );
+    assert_eq!(
+        repo.git(&["show", "b:shared.txt"]),
+        "A_AMENDED\nb1",
+        "b must carry the manually resolved content"
+    );
+    // Metadata fork point was healed to a's new tip — b is no longer "needs
+    // restack" (a second restack is a no-op).
+    let out = repo.gt("restack", "");
+    assert_success(&out, "second restack");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("up to date"),
+        "fork points must be healed so the stack reads as up to date; got:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !git_dir.join("rebase-merge").exists()
+            && !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "a clean finish must leave no rebase and no state"
+    );
+}
+
+#[test]
+fn native_git_rebase_abort_during_restack_leaves_no_gt_state() {
+    // The original report in one assertion: pause a restack, then end it with
+    // native `git rebase --abort` (exactly what `git status` tells you to do).
+    // Because the git-native path keeps no state file, git and gt agree
+    // afterward — no wedged "operation in progress" with a clean `git status`.
+    let (repo, git_dir, b_before) = linear_conflict_repo("restack-native-abort-clean");
+
+    let out = repo.gt("restack", "");
+    assert!(!out.status.success(), "restack must pause");
+
+    repo.git(&["rebase", "--abort"]);
+    assert!(
+        !git_dir.join("rebase-merge").exists(),
+        "native abort clears git's rebase state"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "and there is no gt state file left behind — the desync cannot occur"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "b"]),
+        b_before,
+        "native abort restores b to its pre-restack tip"
+    );
+
+    // gt is not wedged: a fresh restack just works (and re-pauses on the
+    // still-unresolved conflict).
+    let out = repo.gt("restack", "");
+    assert!(
+        !out.status.success() && git_dir.join("rebase-merge").exists(),
+        "restack must run again and re-pause, not refuse with a phantom op; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn restack_abort_is_git_native_and_undoes_the_rebase() {
+    // `gt abort` during a git-native restack is `git rebase --abort`: it undoes
+    // the in-flight rebase and restores the branch, with no state file involved.
+    let (repo, git_dir, b_before) = linear_conflict_repo("restack-native-gt-abort");
+
+    let out = repo.gt("restack", "");
+    assert!(!out.status.success(), "restack must pause");
+
+    let out = repo.gt("abort", "");
+    assert_success(&out, "gt abort");
+    assert!(
+        !git_dir.join("rebase-merge").exists()
+            && !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "abort must leave no rebase and no state"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "b"]),
+        b_before,
+        "abort must restore b to its pre-restack tip"
+    );
+}
+
+#[test]
+fn modify_reconciles_when_user_ends_rebase_with_native_git() {
+    // The state-backed engine (modify/move/sync, and DAG restacks) still pauses
+    // by leaving a live rebase alongside a state file. If the user ends that
+    // rebase out of band with native `git rebase`, the file outlives it and
+    // `git status` looks clean while gt still holds the op. gt must detect this
+    // and reconcile rather than wedge.
+    //
+    // main <- a <- b. `gt modify` on `a` amends it and restacks `b`; the amend
+    // collides with b's edit, so the restack of `b` pauses under the state
+    // engine (a multi-branch operation, unlike the linear git-native path).
+    let repo = TestRepo::new("modify-native-rebase-desync");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+
+    repo.create_with_gt("a feature", "a", "shared.txt", "a1\n");
+    repo.create_with_gt("b feature", "b", "shared.txt", "a1\nb1\n");
+
+    repo.git(&["switch", "-q", "a"]);
+    repo.write("shared.txt", "A_AMENDED\n");
+    repo.git(&["add", "shared.txt"]);
+    let out = repo.gt("modify", "");
+    assert!(!out.status.success(), "modify must pause restacking b");
+
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        git_dir.join("oh-my-gt").join("state.json").exists(),
+        "the state engine must record the paused multi-branch op"
+    );
+
+    // The user ends the rebase out of band. git is clean now; gt's file lingers.
+    repo.git(&["rebase", "--abort"]);
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "native abort must clear git's rebase state"
+    );
+    assert!(
+        git_dir.join("oh-my-gt").join("state.json").exists(),
+        "gt's state file outlives the rebase — the desync under test"
+    );
+
+    // The guard must explain the desync (clean `git status` vs gt's op).
+    let out = repo.gt("modify", "");
+    assert!(!out.status.success(), "a recorded op still blocks modify");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no longer in progress") && stderr.contains("git status"),
+        "the guard must explain the out-of-band end; got stderr:\n{stderr}"
+    );
+
+    // `gt continue` reconciles: notes the out-of-band end and re-drives, which
+    // re-pauses on the still-unresolved conflict — now back under gt.
+    let out = repo.gt("continue", "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ended outside gt"),
+        "continue must report it is reconciling; got:\n{stdout}"
+    );
+    assert!(
+        git_dir.join("rebase-merge").exists(),
+        "reconciling must restore a live rebase to resolve in"
+    );
+
+    // Resolve and finish through gt.
+    repo.write("shared.txt", "A_AMENDED\nb1\n");
+    repo.git(&["add", "shared.txt"]);
+    let out = repo.gt("continue", "");
+    assert_success(&out, "gt continue after resolving");
+    assert_eq!(
+        repo.git(&["rev-parse", "b^"]),
+        repo.git(&["rev-parse", "a"]),
+        "b must end up parented on the amended a"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "a clean finish must clear the state file"
+    );
+}
+
+/// Build the exact "stranded intermediate ref" desync from the bug report:
+///
+/// ```text
+///   main              (advanced past where the stack forked)
+///   └─ docker          new parent, off the advanced main
+///      └─ dvs          intermediate: metadata HEALED to claim it forked on
+///                      docker, but its ref was never moved off the old base
+///         └─ feat      tip: built on a *replay* of dvs's commit (parent
+///                      docker) that no branch points to
+/// ```
+///
+/// Both branches' fork points are internally consistent (each recorded
+/// revision equals its parent's tip), so the plain "fork point lags parent
+/// tip" check sees the stack as fully restacked — yet neither ref actually
+/// sits on its recorded parent. Returns `(repo, stranded_dvs_tip)`.
+fn stranded_intermediate_stack(name: &str) -> (TestRepo, String) {
+    let repo = TestRepo::new(name);
+    repo.write("base.txt", "base\n");
+    repo.commit("c0 old main");
+
+    // main <- dvs <- feat, all tracked through gt the ordinary way.
+    repo.create_with_gt("land ValidatorSet V1", "dvs", "dvs.txt", "v1\n");
+    let dvs_orig = repo.git(&["rev-parse", "dvs"]);
+    repo.create_with_gt("feat antithesis", "feat", "feat.txt", "f1\n");
+
+    // A new parent branch off an advanced main, brought into the stack as dvs's
+    // parent (PR #2234 in the report). gt records the relationship + fork point.
+    repo.git(&["switch", "-q", "main"]);
+    repo.write("base.txt", "base\nnewer\n");
+    repo.commit("newer main");
+    repo.create_with_gt("docker cli init", "docker", "docker.txt", "d\n");
+    let docker_tip = repo.git(&["rev-parse", "docker"]);
+
+    // The post-restack state the report describes: dvs's metadata is healed to
+    // claim it sits on docker, but its ref is left stranded on the old base.
+    // feat is rebuilt on a replay of dvs's commit (parent docker) — the commit
+    // that no branch points to — with its own fork point left at dvs's stranded
+    // tip, so every recorded fork point still matches its parent's tip.
+    repo.write_metadata("dvs", "docker", &docker_tip);
+    let dvs_tree = repo.git(&["rev-parse", "dvs^{tree}"]);
+    let replayed_dvs = repo.git(&[
+        "commit-tree",
+        &dvs_tree,
+        "-p",
+        &docker_tip,
+        "-m",
+        "land ValidatorSet V1",
+    ]);
+    let feat_tree = repo.git(&["rev-parse", "feat^{tree}"]);
+    let replayed_feat = repo.git(&[
+        "commit-tree",
+        &feat_tree,
+        "-p",
+        &replayed_dvs,
+        "-m",
+        "feat antithesis",
+    ]);
+    repo.git(&["update-ref", "refs/heads/feat", &replayed_feat]);
+    repo.write_metadata("feat", "dvs", &dvs_orig);
+
+    (repo, dvs_orig)
+}
+
+#[test]
+fn log_flags_a_stranded_intermediate_ref_whose_metadata_looks_consistent() {
+    // The silent half of the report: a restack moved the tip's ancestry onto a
+    // new base but left an intermediate ref behind, then healed every fork
+    // point so each recorded revision equals its parent's tip. A plain
+    // fork-point comparison reports the stack as consistent; `gt log` must
+    // instead flag any branch whose ref does not descend from its parent.
+    let (repo, dvs_orig) = stranded_intermediate_stack("restack-strand-detect");
+    repo.git(&["switch", "-q", "feat"]);
+
+    // Precondition: the metadata is internally consistent — dvs claims to fork
+    // exactly at docker's tip — so the desync is invisible to a fork-point check.
+    assert_eq!(
+        repo.git(&["cat-file", "-p", "refs/branch-metadata/dvs"]),
+        format!(
+            r#"{{"parentBranchName":"docker","parentBranchRevision":"{}"}}"#,
+            repo.git(&["rev-parse", "docker"])
+        ),
+        "dvs's recorded fork point must equal docker's tip (a consistent-looking lie)"
+    );
+    assert!(
+        repo.git_allow_fail(&["merge-base", "--is-ancestor", "docker", "dvs"])
+            .status
+            .code()
+            != Some(0),
+        "guard: dvs's ref must NOT actually descend from docker"
+    );
+
+    let out = repo.gt("log", "");
+    assert_success(&out, "gt log");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let dvs_line = stdout
+        .lines()
+        .find(|l| l.contains(" dvs "))
+        .unwrap_or_else(|| panic!("no dvs line in gt log:\n{stdout}"));
+    assert!(
+        dvs_line.contains("needs restack"),
+        "the stranded intermediate `dvs` must be flagged; got:\n{stdout}"
+    );
+    let feat_line = stdout
+        .lines()
+        .find(|l| l.contains(" feat "))
+        .unwrap_or_else(|| panic!("no feat line in gt log:\n{stdout}"));
+    assert!(
+        feat_line.contains("needs restack"),
+        "`feat`, built on a commit no branch points to, must be flagged; got:\n{stdout}"
+    );
+
+    // dvs's ref is still its stranded tip — `gt log` only reports, never moves.
+    assert_eq!(repo.git(&["rev-parse", "dvs"]), dvs_orig);
+}
+
+#[test]
+fn restack_does_not_falsely_claim_a_stranded_ref_was_restacked() {
+    // The other half: because the restack plan reads its `--onto` base from the
+    // (healed, lying) fork point, replaying the tip never moves the stranded
+    // intermediate. gt must not announce "restacked dvs" when the ref did not
+    // move — that is precisely how the desync stays silent. It reports the
+    // stranded branch instead, leaves its ref untouched (never lost), and keeps
+    // flagging it.
+    let (repo, dvs_orig) = stranded_intermediate_stack("restack-strand-honest");
+    repo.git(&["switch", "-q", "feat"]);
+
+    let out = repo.gt("restack", "");
+    assert_success(&out, "gt restack");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !stdout.contains("restacked dvs"),
+        "restack must not claim it restacked the ref it could not move; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dvs") && stdout.contains("stranded"),
+        "restack must report the stranded intermediate; got:\n{stdout}"
+    );
+
+    // Golden rule: the stranded ref is left exactly where it was, not lost.
+    assert_eq!(
+        repo.git(&["rev-parse", "dvs"]),
+        dvs_orig,
+        "the stranded ref must be left intact"
+    );
+
+    // And the desync is still surfaced afterward, not silently "healed".
+    let out = repo.gt("log", "");
+    assert_success(&out, "gt log after restack");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dvs_line = stdout.lines().find(|l| l.contains(" dvs ")).unwrap();
+    assert!(
+        dvs_line.contains("needs restack"),
+        "dvs must still be flagged after a restack that could not move it; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn abort_after_out_of_band_continue_leaves_no_phantom_changes() {
+    // The reported failure: a state-backed restack is finished out of band with
+    // native `git rebase --continue`, so HEAD ends on the rebased branch while
+    // gt's state file lingers. `gt abort` then rolls every branch back — and
+    // must not desync the checked-out one. Rolling its ref with `update-ref`
+    // while it is HEAD leaves the index and working tree on the rebased content
+    // (phantom staged changes that contradict the "restored" report) and
+    // strands the user on that branch instead of where they started.
+    let repo = TestRepo::new("abort-no-phantom-changes");
+    repo.write("shared.txt", "base\n");
+    repo.commit("root commit");
+    repo.create_with_gt("a feature", "a", "shared.txt", "a1\n");
+    repo.create_with_gt("b feature", "b", "shared.txt", "a1\nb1\n");
+    let b_before = repo.git(&["rev-parse", "b"]);
+
+    // Amend `a` so restacking `b` conflicts; `gt modify` pauses under the state
+    // engine with a live rebase on `b`.
+    repo.git(&["switch", "-q", "a"]);
+    repo.write("shared.txt", "A_AMENDED\n");
+    repo.git(&["add", "shared.txt"]);
+    let out = repo.gt("modify", "");
+    assert!(!out.status.success(), "modify must pause restacking b");
+
+    // Finish the rebase out of band with native git: HEAD lands on the rebased
+    // `b` and gt's state file is left behind.
+    repo.write("shared.txt", "A_AMENDED\nb1\n");
+    repo.git(&["add", "shared.txt"]);
+    repo.git(&["-c", "core.editor=true", "rebase", "--continue"]);
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("rebase-merge").exists()
+            && git_dir.join("oh-my-gt").join("state.json").exists(),
+        "setup: rebase ended out of band, HEAD on the rebased branch, state file present"
+    );
+    assert_eq!(
+        repo.current_branch(),
+        "b",
+        "setup: HEAD must be on the rebased branch"
+    );
+
+    let out = repo.gt("abort", "");
+    assert_success(&out, "gt abort");
+    assert_eq!(
+        repo.git(&["status", "--porcelain"]),
+        "",
+        "abort must leave a clean working tree, not phantom staged changes"
+    );
+    assert_eq!(
+        repo.current_branch(),
+        "a",
+        "abort must land on the branch the operation started from, not strand HEAD on `b`"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "b"]),
+        b_before,
+        "abort must roll `b` back to its pre-modify tip"
+    );
+}
+
+#[test]
+fn sync_skips_a_branch_checked_out_in_another_worktree() {
+    // The trigger from the report: a branch in the stack is checked out in a
+    // second worktree, so git refuses to rebase it. `gt sync` must skip it (and
+    // anything stacked on it) cleanly — restacking what it can, leaving no
+    // operation behind to abort — rather than failing with a cryptic git error.
+    let repo = TestRepo::new("sync-skip-occupied-worktree");
+    repo.add_origin();
+    repo.write("f.txt", "v0\n");
+    repo.commit("c0");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    // Stack main <- A <- B <- C; leave the primary worktree on C.
+    repo.create_with_gt("A feature", "A", "a.txt", "a\n");
+    repo.create_with_gt("B feature", "B", "b.txt", "b\n");
+    repo.create_with_gt("C feature", "C", "c.txt", "c\n");
+
+    // Occupy the intermediate `B` in a second worktree.
+    let b_wt = repo.root.join("b_wt");
+    repo.git(&["worktree", "add", "-q", b_wt.to_str().unwrap(), "B"]);
+
+    // Advance origin/main so sync wants to restack the whole stack.
+    advance_origin_main(&repo, "upstream commit", "f.txt", "v1\n");
+
+    let out = repo.gt("sync", "");
+    assert_success(&out, "gt sync with an occupied branch must not error");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("restacked A"),
+        "sync must still restack the branch it can; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("B") && stdout.contains("worktree"),
+        "sync must report `B` skipped as checked out in another worktree; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains('C') && stdout.contains("parent not restacked"),
+        "sync must skip `C`, which is stacked on the skipped `B`; got:\n{stdout}"
+    );
+
+    // No operation is left behind to clean up, and the primary worktree is clean
+    // and back on the branch the user started from.
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "a graceful skip must not leave a state file to abort"
+    );
+    assert_eq!(
+        repo.git(&["status", "--porcelain"]),
+        "",
+        "the primary worktree must stay clean"
+    );
+    assert_eq!(repo.current_branch(), "C", "sync must land back on C");
+
+    // The branch it could restack now sits on the advanced trunk; the occupied
+    // one and its descendant were left untouched.
+    assert_eq!(
+        repo.git(&["rev-parse", "A^"]),
+        repo.git(&["rev-parse", "main"]),
+        "A must be restacked onto the updated trunk"
+    );
+}
+
+#[test]
+fn restack_relocates_a_stranded_intermediate_onto_its_replayed_commit() {
+    // The recovery case: an external/partial rebase replayed an intermediate
+    // branch's change onto the advanced parent (leaving an equivalent commit in
+    // the tip's history) but never moved the intermediate's own ref. A plain
+    // `--update-refs` replay can't move it (its old commit isn't in the range),
+    // so gt must find the equivalent commit by patch-id and re-point the ref —
+    // turning the manual `git branch -f` dance into an automatic heal.
+    let repo = TestRepo::new("strand-relocate");
+    repo.write("base.txt", "base\n");
+    repo.commit("c0 main");
+
+    // main <- alpha <- beta <- gamma, all tracked.
+    repo.create_with_gt("alpha work", "alpha", "a.txt", "a\n");
+    repo.create_with_gt("beta fix", "beta", "b.txt", "b\n");
+    let beta_orig = repo.git(&["rev-parse", "beta"]);
+    let beta_commit = beta_orig.clone();
+    repo.create_with_gt("gamma feat", "gamma", "g.txt", "g\n");
+    let gamma_commit = repo.git(&["rev-parse", "gamma"]);
+
+    // The parent advances by one commit (as a real rebase target would).
+    repo.git(&["switch", "-q", "alpha"]);
+    repo.write("a2.txt", "a2\n");
+    repo.commit("alpha advance");
+
+    // Simulate the external rebase: replay beta + gamma onto the advanced alpha
+    // with real cherry-picks (so the replays share the originals' patch-ids),
+    // move gamma onto them, but leave beta's ref stranded on the old line.
+    repo.git(&["switch", "--detach", "alpha"]);
+    repo.git(&["cherry-pick", &beta_commit]);
+    repo.git(&["cherry-pick", &gamma_commit]);
+    let gamma_replayed = repo.git(&["rev-parse", "HEAD"]);
+    repo.git(&["branch", "-f", "gamma", &gamma_replayed]);
+    repo.git(&["switch", "-q", "gamma"]);
+
+    // Preconditions: beta is stranded off the advanced alpha, gamma sits on the
+    // replay (not on beta's ref), and the two beta commits are patch-equivalent.
+    assert!(
+        !repo
+            .git_allow_fail(&["merge-base", "--is-ancestor", "alpha", "beta"])
+            .status
+            .success(),
+        "guard: beta must be stranded off the advanced alpha"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "beta"]),
+        beta_orig,
+        "guard: beta's ref is still on the old line before restack"
+    );
+
+    let out = repo.gt("restack", "");
+    assert_success(&out, "gt restack");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("re-pointed") && stdout.contains("beta"),
+        "restack must report relocating the stranded beta; got:\n{stdout}"
+    );
+
+    // beta's ref moved off the stranded line onto an equivalent commit (same
+    // tree — the replay restack produces), and the stack now descends cleanly.
+    assert_ne!(
+        repo.git(&["rev-parse", "beta"]),
+        beta_orig,
+        "beta's ref must have moved off the stranded line"
+    );
+    assert_eq!(
+        repo.git(&["show", "beta:b.txt"]),
+        "b",
+        "the relocated beta must still carry its own change (b.txt)"
+    );
+    assert!(
+        repo.git_allow_fail(&["merge-base", "--is-ancestor", "alpha", "beta"])
+            .status
+            .success()
+            && repo
+                .git_allow_fail(&["merge-base", "--is-ancestor", "beta", "gamma"])
+                .status
+                .success(),
+        "after relocation the whole path must descend cleanly"
+    );
+
+    // And nothing on the path is flagged anymore.
+    let out = repo.gt("log", "");
+    assert_success(&out, "gt log");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for b in ["alpha", "beta", "gamma"] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(&format!(" {b} ")) || l.contains(&format!(" {b}\u{1b}")))
+            .unwrap_or_else(|| panic!("no {b} line in gt log:\n{stdout}"));
+        assert!(
+            !line.contains("needs restack"),
+            "{b} must not be flagged after relocation; got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn continue_relocates_a_stranded_intermediate_after_native_rebase() {
+    // The same recovery, but through `gt continue` finishing an external rebase.
+    // A native `git rebase` (no `--update-refs`) replays an intermediate's change
+    // into the tip's history but only moves the tip's ref, stranding the
+    // intermediate. When gt finishes that rebase it must relocate the stranded
+    // intermediate onto its replayed commit — not leave the stack desynced.
+    let repo = TestRepo::new("continue-relocate-strand");
+    repo.write("f.txt", "base\n");
+    repo.commit("c0 main");
+
+    // main <- alpha <- beta <- gamma. beta adds a distinct file (replays
+    // cleanly); gamma edits the shared file (will conflict with the advance).
+    repo.create_with_gt("alpha work", "alpha", "a.txt", "a\n");
+    let alpha_old = repo.git(&["rev-parse", "alpha"]);
+    repo.create_with_gt("beta fix", "beta", "b.txt", "b\n");
+    let beta_old = repo.git(&["rev-parse", "beta"]);
+    repo.create_with_gt("gamma feat", "gamma", "f.txt", "base\nG\n");
+
+    // Advance alpha with a change that conflicts with gamma (not beta).
+    repo.git(&["switch", "-q", "alpha"]);
+    repo.write("f.txt", "base\nALPHA\n");
+    repo.git(&["add", "f.txt"]);
+    repo.commit("alpha advance");
+
+    // External rebase of gamma onto the advanced alpha, no `--update-refs`:
+    // beta replays cleanly (so its replay shares beta's patch-id) but its ref is
+    // left behind; gamma then conflicts and the rebase pauses.
+    repo.git(&["switch", "-q", "gamma"]);
+    let reb = repo.git_allow_fail(&["rebase", "--onto", "alpha", &alpha_old, "gamma"]);
+    assert!(
+        !reb.status.success(),
+        "the native rebase should pause on gamma's conflict"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "beta"]),
+        beta_old,
+        "guard: the no-update-refs rebase leaves beta's ref stranded"
+    );
+
+    // Resolve gamma's conflict, then let gt finish the rebase.
+    repo.write("f.txt", "base\nALPHA\nG\n");
+    repo.git(&["add", "f.txt"]);
+    let out = repo.gt("continue", "");
+    assert_success(&out, "gt continue after resolving");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("re-pointed") && stdout.contains("beta"),
+        "continue must relocate the stranded beta; got:\n{stdout}"
+    );
+
+    assert_ne!(
+        repo.git(&["rev-parse", "beta"]),
+        beta_old,
+        "beta's ref must have moved off the stranded line"
+    );
+    assert!(
+        repo.git_allow_fail(&["merge-base", "--is-ancestor", "alpha", "beta"])
+            .status
+            .success()
+            && repo
+                .git_allow_fail(&["merge-base", "--is-ancestor", "beta", "gamma"])
+                .status
+                .success(),
+        "after continue the whole path must descend cleanly"
+    );
+
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "the rebase must be finished, not left in progress"
+    );
+}
+
+#[test]
+fn log_does_not_false_flag_a_shallow_grafted_branch_as_needs_restack() {
+    // The shallow-clone papercut: a branch fetched as a single shallow commit
+    // sits correctly on its parent, but git hides its ancestry behind the graft,
+    // so `is_ancestor(parent, branch)` turns false and the stranded-ref check
+    // would wrongly cry "needs restack". gt must recognise the graft instead and
+    // surface a distinct shallow hint, never a phantom restack flag.
+    let repo = TestRepo::new("shallow-log-hint");
+    repo.write("base.txt", "base\n");
+    repo.commit("c0 main");
+
+    // main <- dvs, tracked the ordinary way; dvs genuinely descends from main.
+    repo.create_with_gt("land ValidatorSet V1", "dvs", "dvs.txt", "v1\n");
+    let dvs_tip = repo.git(&["rev-parse", "dvs"]);
+    assert!(
+        repo.git_allow_fail(&["merge-base", "--is-ancestor", "main", "dvs"])
+            .status
+            .success(),
+        "precondition: dvs descends from main before grafting"
+    );
+
+    // Now pretend dvs was fetched shallowly: its tip becomes a graft boundary,
+    // so git reports it as parentless and `is_ancestor(main, dvs)` goes false.
+    repo.graft(&dvs_tip);
+    assert!(
+        !repo
+            .git_allow_fail(&["merge-base", "--is-ancestor", "main", "dvs"])
+            .status
+            .success(),
+        "guard: the graft must hide dvs's descent from main"
+    );
+
+    // Render from main so dvs's line is unstyled and easy to match.
+    repo.git(&["switch", "-q", "main"]);
+    let out = repo.gt("log", "");
+    assert_success(&out, "gt log");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dvs_line = stdout
+        .lines()
+        .find(|l| l.contains(" dvs "))
+        .unwrap_or_else(|| panic!("no dvs line in gt log:\n{stdout}"));
+    assert!(
+        !dvs_line.contains("needs restack"),
+        "a grafted branch must NOT be flagged as needs-restack; got:\n{stdout}"
+    );
+    assert!(
+        dvs_line.contains("shallow") && dvs_line.contains("unshallow"),
+        "a grafted branch must show a shallow hint pointing at `git fetch --unshallow`; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn restack_refuses_a_shallow_grafted_branch_instead_of_corrupting_the_rebase() {
+    // The dangerous half: replaying a grafted commit makes `rebase
+    // --update-refs` emit a corrupt `update-ref grafted` todo and strand the
+    // rebase. When an advanced ancestor would drag a grafted branch into the
+    // chain, gt must refuse up front, point at `git fetch --unshallow`, and
+    // never start (and strand) a rebase.
+    let repo = TestRepo::new("shallow-restack-refuse");
+    repo.write("base.txt", "base\n");
+    repo.commit("c0 main v1");
+
+    // main <- base <- dvs <- feat, all tracked.
+    repo.create_with_gt("base work", "base", "base_work.txt", "b\n");
+    repo.create_with_gt("land ValidatorSet V1", "dvs", "dvs.txt", "v1\n");
+    let dvs_tip = repo.git(&["rev-parse", "dvs"]);
+    repo.create_with_gt("feat antithesis", "feat", "feat.txt", "f\n");
+
+    // Advance main so `base` genuinely needs a restack — which pulls its
+    // descendant `dvs` into the same linear rebase chain.
+    repo.git(&["switch", "-q", "main"]);
+    repo.write("base.txt", "base\nv2\n");
+    repo.commit("c1 main v2");
+    repo.git(&["switch", "-q", "feat"]);
+
+    // dvs was fetched shallowly: its tip is a graft boundary.
+    repo.graft(&dvs_tip);
+
+    let out = repo.gt("restack", "");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "restack across a graft must fail, not silently corrupt the rebase; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("unshallow"),
+        "the refusal must point at `git fetch --unshallow`; got:\n{combined}"
+    );
+
+    // It must not have started (and stranded) a rebase, nor left gt state.
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "no rebase should be left in progress after the refusal"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "no gt operation state should be left behind"
+    );
+    assert_eq!(
+        repo.current_branch(),
+        "feat",
+        "the refusal must leave the user on their branch"
     );
 }

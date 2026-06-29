@@ -3,6 +3,7 @@
 //! Every `Command::new("git")` in the crate lives here. Higher layers call the
 //! typed helpers and never construct git command lines themselves.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -221,6 +222,74 @@ pub fn is_ancestor(a: &str, b: &str) -> Result<bool> {
     Ok(out.code == 0)
 }
 
+/// Commit SHAs at the repository's shallow-clone boundaries — the contents of
+/// `.git/shallow` — or an empty set when the clone is complete.
+///
+/// git presents a boundary commit as parentless: it hides the real parents even
+/// when those objects are present locally (a stale graft left after the rest of
+/// history was later fetched). Any ancestry query that crosses such a commit
+/// silently returns the wrong answer, and a `rebase --update-refs` that replays
+/// one emits a corrupt `update-ref grafted` todo line. gt reads this set so it
+/// can flag and refuse those branches rather than trust git here.
+pub fn shallow_boundaries() -> Result<HashSet<String>> {
+    // `.git/shallow` lives in the common git dir, which linked worktrees share.
+    let common = run(&["rev-parse", "--git-common-dir"])?;
+    let mut path = PathBuf::from(&common);
+    if path.is_relative() {
+        path = std::env::current_dir()
+            .map_err(|e| GtError::Git(format!("cannot resolve current dir: {e}")))?
+            .join(path);
+    }
+    path.push("shallow");
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Ok(contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(e) => Err(GtError::Git(format!("cannot read {}: {e}", path.display()))),
+    }
+}
+
+/// The stable patch-id of a commit's diff, or `None` for a commit with no
+/// textual diff (a merge, or an empty commit). Two commits with the same
+/// patch-id introduce the same change — the equivalence `git rebase` uses to
+/// recognise an already-applied commit, and how gt locates the commit an
+/// external rebase replayed a stranded branch's tip as.
+pub fn patch_id(commit: &str) -> Result<Option<String>> {
+    let diff = run(&["show", "--no-color", commit])?;
+    if diff.is_empty() {
+        return Ok(None);
+    }
+    let out = run_with_stdin(&["patch-id", "--stable"], diff.as_bytes())?;
+    Ok(out.split_whitespace().next().map(str::to_string))
+}
+
+/// `(patch_id, commit_sha)` for every non-merge commit in `base..tip`. Used to
+/// find the commit equivalent to a stranded branch's tip among those an external
+/// rebase replayed onto the new base.
+pub fn patch_ids_in_range(base: &str, tip: &str) -> Result<Vec<(String, String)>> {
+    let range = format!("{base}..{tip}");
+    let log = run(&["log", "-p", "--no-color", "--no-merges", &range])?;
+    if log.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `git patch-id` reads the diff stream and emits "<patch-id> <commit-sha>"
+    // per commit, pairing each diff with the commit it belongs to.
+    let out = run_with_stdin(&["patch-id", "--stable"], log.as_bytes())?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let pid = it.next()?;
+            let sha = it.next()?;
+            Some((pid.to_string(), sha.to_string()))
+        })
+        .collect())
+}
+
 /// Porcelain working-tree status (empty string means clean).
 pub fn status_porcelain() -> Result<String> {
     run(&["status", "--porcelain"])
@@ -288,6 +357,19 @@ pub fn worktree_owner_of(branch: &str) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+/// If `branch` is checked out in a worktree *other* than the current one,
+/// return that worktree's path. A branch checked out elsewhere cannot be
+/// rebased or switched to (`git` refuses, e.g. `'B' is already used by worktree
+/// at ...`), so callers skip it rather than fail mid-operation.
+pub fn branch_occupied_elsewhere(branch: &str) -> Result<Option<PathBuf>> {
+    let Some(owner) = worktree_owner_of(branch)? else {
+        return Ok(None);
+    };
+    let here = PathBuf::from(run(&["rev-parse", "--show-toplevel"])?);
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    Ok((canon(&owner) != canon(&here)).then_some(owner))
 }
 
 /// Whether the working tree rooted at `worktree` is clean.
