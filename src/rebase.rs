@@ -624,11 +624,19 @@ fn resume_native(style: &OutputStyle) -> Result<()> {
 
 /// After a git-native rebase finishes, refresh `parent_branch_revision` for
 /// every branch in `current`'s stack that now sits on its parent. Returns the
-/// branches whose metadata changed (i.e. those actually restacked). Branches
-/// not descended from their parent (genuinely stale, off the replayed line) are
-/// left untouched.
+/// branches whose metadata changed (i.e. those actually restacked).
+///
+/// A branch left stranded off the replayed line — its ref not descending from
+/// its parent — is rescued when it lies on `current`'s path: an external rebase
+/// commonly replays such a branch's change into `current`'s history without
+/// moving the branch's own ref, so we relocate it onto that equivalent commit
+/// (see [`relocate_stranded`]). Off-path strands (whose commits are not in
+/// `current`'s history) and ones with no equivalent are left for their own
+/// restack. Parent tips are read live, so a relocation is visible to children.
 fn heal_stack_metadata(current: &str) -> Result<Vec<String>> {
+    let style = OutputStyle::stdout();
     let graph = StackGraph::load()?;
+    let on_path: HashSet<String> = graph.path_from_trunk(current).into_iter().collect();
     let mut changed = Vec::new();
     for branch in graph.stack_of(current) {
         if graph.is_trunk(&branch) {
@@ -640,25 +648,49 @@ fn heal_stack_metadata(current: &str) -> Result<Vec<String>> {
         let Some(parent) = node.parent.as_deref() else {
             continue;
         };
-        let Some(parent_node) = graph.get(parent) else {
+        if !graph.nodes.contains_key(parent) {
             continue;
-        };
-        let parent_tip = parent_node.tip.clone();
-        if !git::is_ancestor(&parent_tip, &node.tip)? {
-            continue;
+        }
+        // Read the parent's tip live: an earlier relocation in this loop may
+        // have moved it, and children must see the new position.
+        let parent_tip = git::branch_tip(parent)?;
+        let branch_tip = git::branch_tip(&branch)?;
+        let mut relocated = false;
+        if !git::is_ancestor(&parent_tip, &branch_tip)? {
+            // Only an on-path branch (not `current` itself) has its replayed
+            // commit in `current`'s history to relocate onto.
+            if !(on_path.contains(&branch) && branch != current) {
+                continue;
+            }
+            match relocate_stranded(&branch, &branch_tip, &parent_tip, current)? {
+                Relocation::Moved { from } => {
+                    println!(
+                        "re-pointed {} ({}) onto `{}` (equivalent commit from the rebase)",
+                        style.branch(&branch),
+                        &from[..from.len().min(8)],
+                        parent
+                    );
+                    relocated = true;
+                }
+                _ => continue,
+            }
         }
         let already_recorded = node.meta.as_ref().is_some_and(|m| {
             m.parent_branch_name.as_deref() == Some(parent)
                 && m.parent_branch_revision.as_deref() == Some(parent_tip.as_str())
         });
-        if already_recorded {
+        if already_recorded && !relocated {
             continue;
         }
         let mut m = node.meta.clone().unwrap_or_default();
         m.parent_branch_name = Some(parent.to_string());
         m.parent_branch_revision = Some(parent_tip);
         meta::write(&branch, &m)?;
-        changed.push(branch);
+        // A relocation already reported itself; only fold genuine restacks into
+        // the list `resume_native` prints as "restacked".
+        if !relocated {
+            changed.push(branch);
+        }
     }
     Ok(changed)
 }
@@ -917,6 +949,61 @@ fn drive(mut st: OpState) -> Result<()> {
     complete(st)
 }
 
+/// Outcome of trying to rescue a stranded branch ref by relocating it onto the
+/// commit an external/partial rebase already replayed it as.
+enum Relocation {
+    /// A unique equivalent commit was found and the ref was moved there.
+    Moved { from: String },
+    /// No equivalent commit exists on the rebased line — a genuine divergence
+    /// that needs a real rebase / manual resolution.
+    NoMatch,
+    /// More than one equivalent commit on the rebased line; gt won't guess.
+    Ambiguous(usize),
+}
+
+/// Try to move a stranded `branch` (whose ref, currently `branch_tip`, does not
+/// descend from its reconciled `parent_tip`) onto the commit that
+/// `descendant`'s history already holds for it.
+///
+/// A partial or external `git rebase` can replay a branch's change onto the new
+/// base — leaving an equivalent commit in a descendant's history — yet not move
+/// the branch's own ref (e.g. a rebase without `--update-refs`, or one whose
+/// `update-ref` line was dropped). The replayed commit shares the stranded tip's
+/// **patch-id**, the same equivalence git uses to detect already-applied
+/// commits, so we can find it and re-point the ref. Candidates are taken from
+/// `parent_tip..descendant`, which guarantees any match descends from the parent
+/// (so the move actually fixes the strand). Only a unique match is applied; zero
+/// or several are reported for the caller to surface.
+fn relocate_stranded(
+    branch: &str,
+    branch_tip: &str,
+    parent_tip: &str,
+    descendant: &str,
+) -> Result<Relocation> {
+    // git refuses to move a ref checked out in another worktree; don't try.
+    if git::branch_occupied_elsewhere(branch)?.is_some() {
+        return Ok(Relocation::NoMatch);
+    }
+    let Some(target) = git::patch_id(branch_tip)? else {
+        return Ok(Relocation::NoMatch);
+    };
+    let matches: Vec<String> = git::patch_ids_in_range(parent_tip, descendant)?
+        .into_iter()
+        .filter(|(pid, sha)| *pid == target && sha != branch_tip)
+        .map(|(_, sha)| sha)
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(Relocation::NoMatch),
+        [target_sha] => {
+            git::run(&["update-ref", &git::head_ref(branch), target_sha])?;
+            Ok(Relocation::Moved {
+                from: branch_tip.to_string(),
+            })
+        }
+        many => Ok(Relocation::Ambiguous(many.len())),
+    }
+}
+
 /// Refresh the recorded parent + fork point for each branch in a freshly
 /// rebased linear chain, and report the per-branch outcome. Parent-most first:
 /// each branch's parent is the previous one in the chain (or the chain's own
@@ -927,8 +1014,9 @@ fn drive(mut st: OpState) -> Result<()> {
 /// whose ref does not descend from its parent's new tip was left stranded off
 /// the rebased line, so recording its fork point as the parent tip would claim
 /// a restack that never moved the ref — the exact silent desync this engine
-/// exists to prevent. Such a branch is reported and its metadata left untouched,
-/// so `needs_restack` keeps flagging it rather than vouching for a bad ref.
+/// exists to prevent. Before giving up on such a branch we try to relocate it
+/// onto the equivalent commit the rebase already produced (see
+/// [`relocate_stranded`]); only a strand with no equivalent is left flagged.
 fn write_chain_metadata(chain: &Chain) -> Result<()> {
     let style = OutputStyle::stdout();
     for (i, branch) in chain.branches.iter().enumerate() {
@@ -939,21 +1027,45 @@ fn write_chain_metadata(chain: &Chain) -> Result<()> {
         };
         let parent_tip = git::branch_tip(parent)?;
         let branch_tip = git::branch_tip(branch)?;
+        let mut relocated_from: Option<String> = None;
         if !git::is_ancestor(&parent_tip, &branch_tip)? {
-            println!(
-                "{} `{}` was not moved onto `{}`; its ref is stranded off the rebased \
-                 line and still needs a restack",
-                style.warning("warning:"),
-                branch,
-                parent
-            );
-            continue;
+            match relocate_stranded(branch, &branch_tip, &parent_tip, chain.tip())? {
+                Relocation::Moved { from } => relocated_from = Some(from),
+                Relocation::Ambiguous(n) => {
+                    println!(
+                        "{} `{}` is stranded and matches {n} equivalent commits on the rebased \
+                         line; re-point it by hand (`git branch -f {} <sha>`)",
+                        style.warning("warning:"),
+                        branch,
+                        branch
+                    );
+                    continue;
+                }
+                Relocation::NoMatch => {
+                    println!(
+                        "{} `{}` was not moved onto `{}`; its ref is stranded off the rebased \
+                         line and still needs a restack",
+                        style.warning("warning:"),
+                        branch,
+                        parent
+                    );
+                    continue;
+                }
+            }
         }
         let mut m = meta::read(branch)?.unwrap_or_default();
         m.parent_branch_name = Some(parent.clone());
         m.parent_branch_revision = Some(parent_tip);
         meta::write(branch, &m)?;
-        println!("restacked {}", style.branch(branch));
+        match relocated_from {
+            Some(from) => println!(
+                "re-pointed {} ({}) onto `{}` and restacked (equivalent commit from the rebase)",
+                style.branch(branch),
+                &from[..from.len().min(8)],
+                parent
+            ),
+            None => println!("restacked {}", style.branch(branch)),
+        }
     }
     Ok(())
 }

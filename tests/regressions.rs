@@ -2175,6 +2175,177 @@ fn sync_skips_a_branch_checked_out_in_another_worktree() {
 }
 
 #[test]
+fn restack_relocates_a_stranded_intermediate_onto_its_replayed_commit() {
+    // The recovery case: an external/partial rebase replayed an intermediate
+    // branch's change onto the advanced parent (leaving an equivalent commit in
+    // the tip's history) but never moved the intermediate's own ref. A plain
+    // `--update-refs` replay can't move it (its old commit isn't in the range),
+    // so gt must find the equivalent commit by patch-id and re-point the ref —
+    // turning the manual `git branch -f` dance into an automatic heal.
+    let repo = TestRepo::new("strand-relocate");
+    repo.write("base.txt", "base\n");
+    repo.commit("c0 main");
+
+    // main <- alpha <- beta <- gamma, all tracked.
+    repo.create_with_gt("alpha work", "alpha", "a.txt", "a\n");
+    repo.create_with_gt("beta fix", "beta", "b.txt", "b\n");
+    let beta_orig = repo.git(&["rev-parse", "beta"]);
+    let beta_commit = beta_orig.clone();
+    repo.create_with_gt("gamma feat", "gamma", "g.txt", "g\n");
+    let gamma_commit = repo.git(&["rev-parse", "gamma"]);
+
+    // The parent advances by one commit (as a real rebase target would).
+    repo.git(&["switch", "-q", "alpha"]);
+    repo.write("a2.txt", "a2\n");
+    repo.commit("alpha advance");
+
+    // Simulate the external rebase: replay beta + gamma onto the advanced alpha
+    // with real cherry-picks (so the replays share the originals' patch-ids),
+    // move gamma onto them, but leave beta's ref stranded on the old line.
+    repo.git(&["switch", "--detach", "alpha"]);
+    repo.git(&["cherry-pick", &beta_commit]);
+    repo.git(&["cherry-pick", &gamma_commit]);
+    let gamma_replayed = repo.git(&["rev-parse", "HEAD"]);
+    repo.git(&["branch", "-f", "gamma", &gamma_replayed]);
+    repo.git(&["switch", "-q", "gamma"]);
+
+    // Preconditions: beta is stranded off the advanced alpha, gamma sits on the
+    // replay (not on beta's ref), and the two beta commits are patch-equivalent.
+    assert!(
+        !repo
+            .git_allow_fail(&["merge-base", "--is-ancestor", "alpha", "beta"])
+            .status
+            .success(),
+        "guard: beta must be stranded off the advanced alpha"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "beta"]),
+        beta_orig,
+        "guard: beta's ref is still on the old line before restack"
+    );
+
+    let out = repo.gt("restack", "");
+    assert_success(&out, "gt restack");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("re-pointed") && stdout.contains("beta"),
+        "restack must report relocating the stranded beta; got:\n{stdout}"
+    );
+
+    // beta's ref moved off the stranded line onto an equivalent commit (same
+    // tree — the replay restack produces), and the stack now descends cleanly.
+    assert_ne!(
+        repo.git(&["rev-parse", "beta"]),
+        beta_orig,
+        "beta's ref must have moved off the stranded line"
+    );
+    assert_eq!(
+        repo.git(&["show", "beta:b.txt"]),
+        "b",
+        "the relocated beta must still carry its own change (b.txt)"
+    );
+    assert!(
+        repo.git_allow_fail(&["merge-base", "--is-ancestor", "alpha", "beta"])
+            .status
+            .success()
+            && repo
+                .git_allow_fail(&["merge-base", "--is-ancestor", "beta", "gamma"])
+                .status
+                .success(),
+        "after relocation the whole path must descend cleanly"
+    );
+
+    // And nothing on the path is flagged anymore.
+    let out = repo.gt("log", "");
+    assert_success(&out, "gt log");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for b in ["alpha", "beta", "gamma"] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(&format!(" {b} ")) || l.contains(&format!(" {b}\u{1b}")))
+            .unwrap_or_else(|| panic!("no {b} line in gt log:\n{stdout}"));
+        assert!(
+            !line.contains("needs restack"),
+            "{b} must not be flagged after relocation; got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn continue_relocates_a_stranded_intermediate_after_native_rebase() {
+    // The same recovery, but through `gt continue` finishing an external rebase.
+    // A native `git rebase` (no `--update-refs`) replays an intermediate's change
+    // into the tip's history but only moves the tip's ref, stranding the
+    // intermediate. When gt finishes that rebase it must relocate the stranded
+    // intermediate onto its replayed commit — not leave the stack desynced.
+    let repo = TestRepo::new("continue-relocate-strand");
+    repo.write("f.txt", "base\n");
+    repo.commit("c0 main");
+
+    // main <- alpha <- beta <- gamma. beta adds a distinct file (replays
+    // cleanly); gamma edits the shared file (will conflict with the advance).
+    repo.create_with_gt("alpha work", "alpha", "a.txt", "a\n");
+    let alpha_old = repo.git(&["rev-parse", "alpha"]);
+    repo.create_with_gt("beta fix", "beta", "b.txt", "b\n");
+    let beta_old = repo.git(&["rev-parse", "beta"]);
+    repo.create_with_gt("gamma feat", "gamma", "f.txt", "base\nG\n");
+
+    // Advance alpha with a change that conflicts with gamma (not beta).
+    repo.git(&["switch", "-q", "alpha"]);
+    repo.write("f.txt", "base\nALPHA\n");
+    repo.git(&["add", "f.txt"]);
+    repo.commit("alpha advance");
+
+    // External rebase of gamma onto the advanced alpha, no `--update-refs`:
+    // beta replays cleanly (so its replay shares beta's patch-id) but its ref is
+    // left behind; gamma then conflicts and the rebase pauses.
+    repo.git(&["switch", "-q", "gamma"]);
+    let reb = repo.git_allow_fail(&["rebase", "--onto", "alpha", &alpha_old, "gamma"]);
+    assert!(
+        !reb.status.success(),
+        "the native rebase should pause on gamma's conflict"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "beta"]),
+        beta_old,
+        "guard: the no-update-refs rebase leaves beta's ref stranded"
+    );
+
+    // Resolve gamma's conflict, then let gt finish the rebase.
+    repo.write("f.txt", "base\nALPHA\nG\n");
+    repo.git(&["add", "f.txt"]);
+    let out = repo.gt("continue", "");
+    assert_success(&out, "gt continue after resolving");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("re-pointed") && stdout.contains("beta"),
+        "continue must relocate the stranded beta; got:\n{stdout}"
+    );
+
+    assert_ne!(
+        repo.git(&["rev-parse", "beta"]),
+        beta_old,
+        "beta's ref must have moved off the stranded line"
+    );
+    assert!(
+        repo.git_allow_fail(&["merge-base", "--is-ancestor", "alpha", "beta"])
+            .status
+            .success()
+            && repo
+                .git_allow_fail(&["merge-base", "--is-ancestor", "beta", "gamma"])
+                .status
+                .success(),
+        "after continue the whole path must descend cleanly"
+    );
+
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "the rebase must be finished, not left in progress"
+    );
+}
+
+#[test]
 fn log_does_not_false_flag_a_shallow_grafted_branch_as_needs_restack() {
     // The shallow-clone papercut: a branch fetched as a single shallow commit
     // sits correctly on its parent, but git hides its ancestry behind the graft,

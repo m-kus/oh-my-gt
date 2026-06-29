@@ -253,6 +253,43 @@ pub fn shallow_boundaries() -> Result<HashSet<String>> {
     }
 }
 
+/// The stable patch-id of a commit's diff, or `None` for a commit with no
+/// textual diff (a merge, or an empty commit). Two commits with the same
+/// patch-id introduce the same change — the equivalence `git rebase` uses to
+/// recognise an already-applied commit, and how gt locates the commit an
+/// external rebase replayed a stranded branch's tip as.
+pub fn patch_id(commit: &str) -> Result<Option<String>> {
+    let diff = run(&["show", "--no-color", commit])?;
+    if diff.is_empty() {
+        return Ok(None);
+    }
+    let out = run_with_stdin(&["patch-id", "--stable"], diff.as_bytes())?;
+    Ok(out.split_whitespace().next().map(str::to_string))
+}
+
+/// `(patch_id, commit_sha)` for every non-merge commit in `base..tip`. Used to
+/// find the commit equivalent to a stranded branch's tip among those an external
+/// rebase replayed onto the new base.
+pub fn patch_ids_in_range(base: &str, tip: &str) -> Result<Vec<(String, String)>> {
+    let range = format!("{base}..{tip}");
+    let log = run(&["log", "-p", "--no-color", "--no-merges", &range])?;
+    if log.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `git patch-id` reads the diff stream and emits "<patch-id> <commit-sha>"
+    // per commit, pairing each diff with the commit it belongs to.
+    let out = run_with_stdin(&["patch-id", "--stable"], log.as_bytes())?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let pid = it.next()?;
+            let sha = it.next()?;
+            Some((pid.to_string(), sha.to_string()))
+        })
+        .collect())
+}
+
 /// Porcelain working-tree status (empty string means clean).
 pub fn status_porcelain() -> Result<String> {
     run(&["status", "--porcelain"])
