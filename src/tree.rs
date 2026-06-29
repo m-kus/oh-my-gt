@@ -193,8 +193,15 @@ fn format_line(
             if matches!(format, LineFormat::Detailed) {
                 let short = &node.tip[..node.tip.len().min(8)];
                 line.push_str(&format!("  {}", style.glyph(short)));
-                if name != graph.trunk && graph.needs_restack(name) {
-                    line.push_str(&format!("  {}", style.restack_marker("(needs restack)")));
+                if name != graph.trunk {
+                    if graph.is_grafted(name) {
+                        line.push_str(&format!(
+                            "  {}",
+                            style.restack_marker("(shallow — run `git fetch --unshallow`)")
+                        ));
+                    } else if graph.needs_restack(name) {
+                        line.push_str(&format!("  {}", style.restack_marker("(needs restack)")));
+                    }
                 }
             }
             line
@@ -267,6 +274,7 @@ mod tests {
             nodes,
             trunk: "main".into(),
             current: Some("gamma".into()),
+            shallow: std::collections::HashSet::new(),
         }
     }
 

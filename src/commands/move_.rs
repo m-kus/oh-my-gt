@@ -167,6 +167,7 @@ mod tests {
             nodes,
             trunk: "main".into(),
             current: Some("beta".into()),
+            shallow: std::collections::HashSet::new(),
         }
     }
 

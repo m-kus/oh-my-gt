@@ -358,6 +358,7 @@ pub fn start(graph: &StackGraph, plan: RestackPlan) -> Result<()> {
         .flat_map(|c| c.branches.iter().cloned())
         .collect();
     ensure_no_occupied_branches(&touched)?;
+    ensure_no_grafted_branches(&touched, &graph.shallow)?;
     let st = prepare(graph, plan)?;
     state::save(&st)?;
     drive(st)
@@ -563,6 +564,9 @@ pub fn restack_native(chain: Chain, current: &str) -> Result<()> {
     // `--update-refs` moves every ref on the chain; git refuses to touch one
     // checked out in another worktree. Refuse up front rather than fail partway.
     ensure_no_occupied_branches(&chain.branches)?;
+    // A grafted (shallow-boundary) branch makes `--update-refs` write a corrupt
+    // `update-ref grafted` todo and strand the rebase; refuse before starting.
+    ensure_no_grafted_branches(&chain.branches, &git::shallow_boundaries()?)?;
     let new_base = git::branch_tip(&chain.parent)?;
     let out = git::run_allow_fail(&[
         "rebase",
@@ -699,6 +703,10 @@ fn print_conflict_pause(branch: Option<&str>) {
 ///   (`gt continue` / `gt abort`), exactly like [`drive`].
 fn drive_best_effort(mut st: OpState) -> Result<()> {
     let style = OutputStyle::stdout();
+    // Branches on a shallow-clone graft boundary can't be rebased (see
+    // [`ensure_no_grafted_branches`]); best-effort skips them and their
+    // dependents rather than aborting the whole pass, like an off-path conflict.
+    let shallow = git::shallow_boundaries()?;
     loop {
         let mut all_done = true;
         for idx in 0..st.chains.len() {
@@ -720,6 +728,25 @@ fn drive_best_effort(mut st: OpState) -> Result<()> {
 
             st.current_chain = idx;
             let chain = st.chains[idx].clone();
+
+            // A branch on a shallow graft boundary can't be rebased without
+            // corrupting the rebase (a bogus `update-ref grafted` todo). Skip
+            // the chain and anything stacked on it, pointing at the fix.
+            if let Some(grafted) = chain.branches.iter().find(|b| {
+                git::branch_tip(b)
+                    .map(|tip| shallow.contains(&tip))
+                    .unwrap_or(false)
+            }) {
+                println!(
+                    "{} {} sits on a shallow clone's graft boundary; run `git fetch --unshallow` \
+                     to restack it. Skipping it and anything stacked on it",
+                    style.warning("skipped:"),
+                    style.branch(grafted)
+                );
+                abandon_chain_and_dependents(&mut st, idx, &style);
+                state::save(&st)?;
+                continue;
+            }
 
             // A branch checked out in another worktree can't be rebased — git
             // refuses to touch it — so attempting it just fails with a cryptic
@@ -794,6 +821,27 @@ fn ensure_no_occupied_branches(branches: &[String]) -> Result<()> {
                 "`{b}` is checked out in another worktree ({}); close that worktree or check \
                  the branch out there to restack it",
                 path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse if any of `branches` sits on a shallow-clone graft boundary. git
+/// hides such a commit's real parents, so `rebase --update-refs` replaying one
+/// emits a corrupt `update-ref grafted` todo that strands the rebase, and every
+/// ancestry check around it lies. Deepening the clone is the only safe fix.
+fn ensure_no_grafted_branches(branches: &[String], shallow: &HashSet<String>) -> Result<()> {
+    if shallow.is_empty() {
+        return Ok(());
+    }
+    for b in branches {
+        let tip = git::branch_tip(b)?;
+        if shallow.contains(&tip) {
+            return Err(GtError::Precondition(format!(
+                "`{b}` sits on a shallow clone's graft boundary, so git cannot see its history \
+                 and gt cannot rebase it safely. Run `git fetch --unshallow` (or deepen the \
+                 clone enough to cover it) first"
             )));
         }
     }

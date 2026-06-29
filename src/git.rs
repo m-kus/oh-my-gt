@@ -3,6 +3,7 @@
 //! Every `Command::new("git")` in the crate lives here. Higher layers call the
 //! typed helpers and never construct git command lines themselves.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -219,6 +220,37 @@ pub fn merge_base(a: &str, b: &str) -> Result<String> {
 pub fn is_ancestor(a: &str, b: &str) -> Result<bool> {
     let out = run_allow_fail(&["merge-base", "--is-ancestor", a, b])?;
     Ok(out.code == 0)
+}
+
+/// Commit SHAs at the repository's shallow-clone boundaries — the contents of
+/// `.git/shallow` — or an empty set when the clone is complete.
+///
+/// git presents a boundary commit as parentless: it hides the real parents even
+/// when those objects are present locally (a stale graft left after the rest of
+/// history was later fetched). Any ancestry query that crosses such a commit
+/// silently returns the wrong answer, and a `rebase --update-refs` that replays
+/// one emits a corrupt `update-ref grafted` todo line. gt reads this set so it
+/// can flag and refuse those branches rather than trust git here.
+pub fn shallow_boundaries() -> Result<HashSet<String>> {
+    // `.git/shallow` lives in the common git dir, which linked worktrees share.
+    let common = run(&["rev-parse", "--git-common-dir"])?;
+    let mut path = PathBuf::from(&common);
+    if path.is_relative() {
+        path = std::env::current_dir()
+            .map_err(|e| GtError::Git(format!("cannot resolve current dir: {e}")))?
+            .join(path);
+    }
+    path.push("shallow");
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Ok(contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(e) => Err(GtError::Git(format!("cannot read {}: {e}", path.display()))),
+    }
 }
 
 /// Porcelain working-tree status (empty string means clean).

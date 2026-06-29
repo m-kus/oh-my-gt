@@ -45,6 +45,10 @@ pub struct StackGraph {
     pub nodes: HashMap<String, BranchNode>,
     pub trunk: String,
     pub current: Option<String>,
+    /// Commit SHAs at the repository's shallow-clone graft boundaries (empty in
+    /// a complete clone). A branch whose tip is one of these has its real
+    /// ancestry hidden from git, so gt can neither verify nor rebase it.
+    pub shallow: HashSet<String>,
 }
 
 impl StackGraph {
@@ -62,6 +66,7 @@ impl StackGraph {
             .filter_map(|m| m.parent_branch_revision.clone())
             .collect();
         let live_revs = batch_existing(&revs)?;
+        let shallow = git::shallow_boundaries()?;
 
         let mut nodes: HashMap<String, BranchNode> = HashMap::new();
         for (name, tip) in &heads {
@@ -83,6 +88,7 @@ impl StackGraph {
             nodes,
             trunk,
             current,
+            shallow,
         };
         graph.validate(&heads, &live_revs);
         graph.link_children();
@@ -228,6 +234,15 @@ impl StackGraph {
         if node.validation != Validation::Valid {
             return false;
         }
+        // A branch sitting on a shallow-clone graft boundary has its real parent
+        // hidden, so the ancestry checks below can only return false negatives —
+        // and a rebase that replayed its grafted commit would emit a corrupt
+        // `update-ref grafted` todo. We cannot judge it here, so don't cry wolf:
+        // the tree renders a distinct shallow hint and the rebase engine refuses
+        // outright until the clone is deepened.
+        if self.is_grafted(name) {
+            return false;
+        }
         let parent = node.parent.as_deref().unwrap();
         let recorded = node
             .meta
@@ -246,6 +261,15 @@ impl StackGraph {
         // off chance git can't answer, flag it rather than vouch for the ref —
         // a spurious marker is harmless, a hidden desync is the bug we're after.
         !git::is_ancestor(parent_tip, &node.tip).unwrap_or(false)
+    }
+
+    /// Whether `name`'s tip sits on a shallow-clone graft boundary, so git
+    /// hides its real ancestry. gt can neither verify nor safely rebase such a
+    /// branch until the clone is deepened (`git fetch --unshallow`).
+    pub fn is_grafted(&self, name: &str) -> bool {
+        self.nodes
+            .get(name)
+            .is_some_and(|n| self.shallow.contains(&n.tip))
     }
 
     /// Self + all descendants, parents before children (topological).
@@ -455,6 +479,7 @@ mod tests {
             nodes,
             trunk: "main".to_string(),
             current: Some("alpha".to_string()),
+            shallow: HashSet::new(),
         };
         graph.validate(&heads, &live_revs);
 

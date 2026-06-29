@@ -257,6 +257,15 @@ impl TestRepo {
         self.git(&["rev-parse", "HEAD"])
     }
 
+    /// Mark `sha` as a shallow-clone graft boundary by writing it to
+    /// `.git/shallow`, reproducing a branch fetched as a single shallow commit:
+    /// git then hides its real parents (presents it as parentless) even though
+    /// the objects are present, exactly as a stale graft after later fetches.
+    fn graft(&self, sha: &str) {
+        let git_dir = PathBuf::from(self.git(&["rev-parse", "--absolute-git-dir"]));
+        fs::write(git_dir.join("shallow"), format!("{sha}\n")).unwrap();
+    }
+
     fn current_branch(&self) -> String {
         self.git(&["symbolic-ref", "--short", "HEAD"])
     }
@@ -2162,5 +2171,115 @@ fn sync_skips_a_branch_checked_out_in_another_worktree() {
         repo.git(&["rev-parse", "A^"]),
         repo.git(&["rev-parse", "main"]),
         "A must be restacked onto the updated trunk"
+    );
+}
+
+#[test]
+fn log_does_not_false_flag_a_shallow_grafted_branch_as_needs_restack() {
+    // The shallow-clone papercut: a branch fetched as a single shallow commit
+    // sits correctly on its parent, but git hides its ancestry behind the graft,
+    // so `is_ancestor(parent, branch)` turns false and the stranded-ref check
+    // would wrongly cry "needs restack". gt must recognise the graft instead and
+    // surface a distinct shallow hint, never a phantom restack flag.
+    let repo = TestRepo::new("shallow-log-hint");
+    repo.write("base.txt", "base\n");
+    repo.commit("c0 main");
+
+    // main <- dvs, tracked the ordinary way; dvs genuinely descends from main.
+    repo.create_with_gt("land ValidatorSet V1", "dvs", "dvs.txt", "v1\n");
+    let dvs_tip = repo.git(&["rev-parse", "dvs"]);
+    assert!(
+        repo.git_allow_fail(&["merge-base", "--is-ancestor", "main", "dvs"])
+            .status
+            .success(),
+        "precondition: dvs descends from main before grafting"
+    );
+
+    // Now pretend dvs was fetched shallowly: its tip becomes a graft boundary,
+    // so git reports it as parentless and `is_ancestor(main, dvs)` goes false.
+    repo.graft(&dvs_tip);
+    assert!(
+        !repo
+            .git_allow_fail(&["merge-base", "--is-ancestor", "main", "dvs"])
+            .status
+            .success(),
+        "guard: the graft must hide dvs's descent from main"
+    );
+
+    // Render from main so dvs's line is unstyled and easy to match.
+    repo.git(&["switch", "-q", "main"]);
+    let out = repo.gt("log", "");
+    assert_success(&out, "gt log");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dvs_line = stdout
+        .lines()
+        .find(|l| l.contains(" dvs "))
+        .unwrap_or_else(|| panic!("no dvs line in gt log:\n{stdout}"));
+    assert!(
+        !dvs_line.contains("needs restack"),
+        "a grafted branch must NOT be flagged as needs-restack; got:\n{stdout}"
+    );
+    assert!(
+        dvs_line.contains("shallow") && dvs_line.contains("unshallow"),
+        "a grafted branch must show a shallow hint pointing at `git fetch --unshallow`; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn restack_refuses_a_shallow_grafted_branch_instead_of_corrupting_the_rebase() {
+    // The dangerous half: replaying a grafted commit makes `rebase
+    // --update-refs` emit a corrupt `update-ref grafted` todo and strand the
+    // rebase. When an advanced ancestor would drag a grafted branch into the
+    // chain, gt must refuse up front, point at `git fetch --unshallow`, and
+    // never start (and strand) a rebase.
+    let repo = TestRepo::new("shallow-restack-refuse");
+    repo.write("base.txt", "base\n");
+    repo.commit("c0 main v1");
+
+    // main <- base <- dvs <- feat, all tracked.
+    repo.create_with_gt("base work", "base", "base_work.txt", "b\n");
+    repo.create_with_gt("land ValidatorSet V1", "dvs", "dvs.txt", "v1\n");
+    let dvs_tip = repo.git(&["rev-parse", "dvs"]);
+    repo.create_with_gt("feat antithesis", "feat", "feat.txt", "f\n");
+
+    // Advance main so `base` genuinely needs a restack — which pulls its
+    // descendant `dvs` into the same linear rebase chain.
+    repo.git(&["switch", "-q", "main"]);
+    repo.write("base.txt", "base\nv2\n");
+    repo.commit("c1 main v2");
+    repo.git(&["switch", "-q", "feat"]);
+
+    // dvs was fetched shallowly: its tip is a graft boundary.
+    repo.graft(&dvs_tip);
+
+    let out = repo.gt("restack", "");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "restack across a graft must fail, not silently corrupt the rebase; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("unshallow"),
+        "the refusal must point at `git fetch --unshallow`; got:\n{combined}"
+    );
+
+    // It must not have started (and stranded) a rebase, nor left gt state.
+    let git_dir = PathBuf::from(repo.git(&["rev-parse", "--absolute-git-dir"]));
+    assert!(
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+        "no rebase should be left in progress after the refusal"
+    );
+    assert!(
+        !git_dir.join("oh-my-gt").join("state.json").exists(),
+        "no gt operation state should be left behind"
+    );
+    assert_eq!(
+        repo.current_branch(),
+        "feat",
+        "the refusal must leave the user on their branch"
     );
 }
