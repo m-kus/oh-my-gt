@@ -1,9 +1,13 @@
 //! `gt submit` — push the downstack and create or update its pull requests.
 
+use std::io::Write;
+use std::time::Instant;
+
 use crate::error::{GtError, Result};
 use crate::gh::PrView;
 use crate::graph::StackGraph;
 use crate::meta::PrInfo;
+use crate::style::OutputStyle;
 use crate::{gh, git, meta};
 
 /// Stable HTML-comment markers delimiting the auto-generated stack overview
@@ -11,6 +15,27 @@ use crate::{gh, git, meta};
 /// and rewritten on every submit; anything outside is left alone.
 const STACK_START: &str = "<!-- gt-stack-start -->";
 const STACK_END: &str = "<!-- gt-stack-end -->";
+
+/// Run one network step, printing a live `  <label>… ` line to stderr and
+/// appending its elapsed time once it returns (or `failed` if it errors).
+///
+/// Submitting a stack is a sequence of slow network round-trips — a push and
+/// one or more `gh` API calls per branch — with nothing to show in between, so
+/// `gt submit` otherwise looks hung. Progress goes to stderr so stdout stays the
+/// clean, pipeable list of submitted PRs; timing makes it obvious which round
+/// trip is the slow one.
+fn step<T>(style: &OutputStyle, label: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    eprint!("  {label}… ");
+    let _ = std::io::stderr().flush();
+    let start = Instant::now();
+    let result = f();
+    let secs = start.elapsed().as_secs_f64();
+    match &result {
+        Ok(_) => eprintln!("{}", style.status(format!("{secs:.1}s"))),
+        Err(_) => eprintln!("{}", style.error("failed")),
+    }
+    result
+}
 
 pub fn run() -> Result<()> {
     let (graph, current) = StackGraph::load_current()?;
@@ -40,6 +65,13 @@ pub fn run() -> Result<()> {
     }
     git::ensure_remote()?;
 
+    let style = OutputStyle::stderr();
+    let total = to_submit.len();
+    eprintln!(
+        "submitting {total} branch{} to origin",
+        if total == 1 { "" } else { "es" }
+    );
+
     // First pass: push each branch and ensure a PR exists with the correct
     // base. We collect the resulting PrView (which carries the live PR body)
     // for use in the second pass, where we render and apply the stack overview.
@@ -51,30 +83,53 @@ pub fn run() -> Result<()> {
             to_submit[i - 1].clone()
         };
 
+        eprintln!(
+            "{} {}",
+            style.status(format!("[{}/{total}]", i + 1)),
+            style.branch(branch)
+        );
+
         // Restacks rewrite history, so force-with-lease rather than plain push.
         let refspec = git::head_refspec(branch);
-        git::run(&["push", "--force-with-lease", "origin", &refspec])?;
+        step(&style, "pushing to origin", || {
+            git::run(&["push", "--force-with-lease", "origin", &refspec]).map(|_| ())
+        })?;
 
         let m = meta::read(branch)?.unwrap_or_default();
         let existing = m.pr_info.as_ref().and_then(|p| p.number);
 
         let (pr, was_existing) = match existing {
             Some(num) => {
-                gh::set_base(num, &base)?;
-                let v = gh::view(branch)?.ok_or_else(|| {
+                step(
+                    &style,
+                    &format!("retargeting PR #{num} base → {base}"),
+                    || gh::set_base(num, &base),
+                )?;
+                let v = step(&style, &format!("reading back PR #{num}"), || {
+                    gh::view(branch)
+                })?
+                .ok_or_else(|| {
                     GtError::Gh(format!("PR #{num} for `{branch}` could not be read back"))
                 })?;
                 (v, true)
             }
-            None => match gh::view(branch)? {
+            None => match step(&style, "looking up existing PR", || gh::view(branch))? {
                 // A PR already exists for this branch — adopt and re-target it.
                 Some(v) => {
                     let need_refresh = v.base != base;
                     if need_refresh {
-                        gh::set_base(v.number, &base)?;
+                        let num = v.number;
+                        step(
+                            &style,
+                            &format!("retargeting PR #{num} base → {base}"),
+                            || gh::set_base(num, &base),
+                        )?;
                     }
                     let view = if need_refresh {
-                        gh::view(branch)?.unwrap_or(v)
+                        step(&style, &format!("reading back PR #{}", v.number), || {
+                            gh::view(branch)
+                        })?
+                        .unwrap_or(v)
                     } else {
                         v
                     };
@@ -88,10 +143,12 @@ pub fn run() -> Result<()> {
                     let branch_ref = git::head_ref(branch);
                     let full = git::run(&["show", "-s", "--format=%B", &branch_ref])?;
                     let (title, body) = split_subject_body(&full);
-                    gh::create(branch, &base, &title, &body)?;
-                    let v = gh::view(branch)?.ok_or_else(|| {
-                        GtError::Gh(format!("PR for `{branch}` could not be read back"))
+                    step(&style, "creating draft PR", || {
+                        gh::create(branch, &base, &title, &body)
                     })?;
+                    let v = step(&style, "reading back new PR", || gh::view(branch))?.ok_or_else(
+                        || GtError::Gh(format!("PR for `{branch}` could not be read back")),
+                    )?;
                     (v, false)
                 }
             },
@@ -113,10 +170,18 @@ pub fn run() -> Result<()> {
         None
     };
 
+    if prs.len() > 1 {
+        eprintln!("updating stack overview in each PR description");
+    }
+
     for (branch, pr, was_existing) in &prs {
         let new_body = compose_body(&pr.body, section.as_deref(), &pr.url);
         if new_body != pr.body {
-            gh::set_body(pr.number, &new_body)?;
+            step(
+                &style,
+                &format!("updating description of PR #{}", pr.number),
+                || gh::set_body(pr.number, &new_body),
+            )?;
         }
 
         let mut m = meta::read(branch)?.unwrap_or_default();
