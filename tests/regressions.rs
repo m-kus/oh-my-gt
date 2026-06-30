@@ -2454,3 +2454,63 @@ fn restack_refuses_a_shallow_grafted_branch_instead_of_corrupting_the_rebase() {
         "the refusal must leave the user on their branch"
     );
 }
+
+#[test]
+fn submit_skips_push_for_branches_already_up_to_date() {
+    // A force-push of a branch whose tip already matches its remote-tracking ref
+    // is a no-op round trip. On a re-submit of an unchanged stack every push is
+    // redundant, so submit must skip them — and push only the branches that
+    // actually moved.
+    let repo = TestRepo::new("submit-skip-uptodate-push");
+    repo.add_origin();
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    repo.create_with_gt("alpha feature", "alpha", "alpha.txt", "alpha\n");
+    repo.create_with_gt("beta feature", "beta", "beta.txt", "beta\n");
+
+    // First submit: neither branch is on origin yet, so both are pushed.
+    let out = repo.gt("submit", "");
+    assert_success(&out, "gt submit (initial)");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("pushing to origin").count(),
+        2,
+        "the first submit must push both branches; got stderr:\n{stderr}"
+    );
+
+    // Re-submit with nothing changed: both branches already match origin.
+    let out = repo.gt("submit", "");
+    assert_success(&out, "gt submit (no-op)");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("pushing to origin").count(),
+        0,
+        "an unchanged stack must push nothing; got stderr:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("push skipped").count(),
+        2,
+        "both up-to-date branches must report the skip; got stderr:\n{stderr}"
+    );
+
+    // Amend only beta: it must push, while alpha stays skipped.
+    repo.git(&["switch", "-q", "beta"]);
+    repo.write("beta.txt", "beta v2\n");
+    repo.git(&["add", "beta.txt"]);
+    repo.git(&["commit", "-q", "--amend", "--no-edit"]);
+    let out = repo.gt("submit", "");
+    assert_success(&out, "gt submit (beta changed)");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("pushing to origin").count(),
+        1,
+        "only the changed branch must push; got stderr:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("push skipped").count(),
+        1,
+        "the unchanged branch must still skip; got stderr:\n{stderr}"
+    );
+}
