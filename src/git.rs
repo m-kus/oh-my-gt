@@ -201,6 +201,15 @@ pub fn branch_tip(name: &str) -> Result<String> {
         .ok_or_else(|| GtError::Git(format!("branch `{name}` does not exist")))
 }
 
+/// Tip SHA of the remote-tracking ref `refs/remotes/<remote>/<branch>`, or
+/// `None` when it does not exist (the branch was never pushed/fetched). This is
+/// the last position gt knows the remote held — the same ref `--force-with-lease`
+/// leases against — so comparing a local tip to it tells us, without a network
+/// round trip, whether a push would change anything.
+pub fn remote_tracking_tip(remote: &str, branch: &str) -> Result<Option<String>> {
+    rev_parse_opt(&format!("refs/remotes/{remote}/{branch}"))
+}
+
 /// Switch to `branch` if it exists; otherwise do nothing.
 pub fn switch_if_exists(branch: &str) -> Result<()> {
     if branch_exists(branch)? {

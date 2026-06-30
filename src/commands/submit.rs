@@ -89,11 +89,20 @@ pub fn run() -> Result<()> {
             style.branch(branch)
         );
 
-        // Restacks rewrite history, so force-with-lease rather than plain push.
-        let refspec = git::head_refspec(branch);
-        step(&style, "pushing to origin", || {
-            git::run(&["push", "--force-with-lease", "origin", &refspec]).map(|_| ())
-        })?;
+        // Skip the push when the branch already matches its remote-tracking
+        // ref: a force-push would be a no-op, and that ref is what
+        // `--force-with-lease` checks anyway, so the comparison is free and
+        // consistent. Restacks rewrite history, so when a push is needed it is
+        // force-with-lease rather than a plain push.
+        let local_tip = git::branch_tip(branch)?;
+        if git::remote_tracking_tip("origin", branch)?.as_deref() == Some(local_tip.as_str()) {
+            eprintln!("  {}", style.status("already on origin, push skipped"));
+        } else {
+            let refspec = git::head_refspec(branch);
+            step(&style, "pushing to origin", || {
+                git::run(&["push", "--force-with-lease", "origin", &refspec]).map(|_| ())
+            })?;
+        }
 
         let m = meta::read(branch)?.unwrap_or_default();
         let existing = m.pr_info.as_ref().and_then(|p| p.number);
