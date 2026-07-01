@@ -49,7 +49,13 @@ pub fn run() -> Result<()> {
             return Ok(());
         }
         "version" | "-V" | "--version" => {
-            println!("gt {}", env!("CARGO_PKG_VERSION"));
+            // `GT_GIT_INFO` is set by build.rs to `<sha>[-dirty] <date>`; empty
+            // when built outside a git checkout. Compare the sha to
+            // `git rev-parse --short HEAD` to see if this build is the latest.
+            match env!("GT_GIT_INFO") {
+                "" => println!("gt {}", env!("CARGO_PKG_VERSION")),
+                git => println!("gt {} ({git})", env!("CARGO_PKG_VERSION")),
+            }
             return Ok(());
         }
         _ => {}
