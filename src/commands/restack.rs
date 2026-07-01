@@ -36,15 +36,21 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     // The common case: a single linear chain (the current stack, no branch
-    // points). Replay it as one `git rebase --update-refs` with no resume state
-    // of its own — git owns the paused state, so `git status` and gt agree and
-    // native `git rebase --continue` / `--abort` work as expected.
-    if plan.chains.len() == 1 {
+    // points) whose refs really do form a line down to the tip. Replay it as one
+    // `git rebase --update-refs` with no resume state of its own — git owns the
+    // paused state, so `git status` and gt agree and native `git rebase
+    // --continue` / `--abort` work as expected.
+    if plan.chains.len() == 1 && rebase::chain_is_natively_restackable(&graph, &plan.chains[0])? {
         return rebase::restack_native(plan.chains.remove(0), &current);
     }
-    // Branch points: fall back to the state-backed engine. Per-branch chains so
-    // a conflict on one branch leaves earlier branches in the same chain
-    // restacked cleanly — the same trade-off `gt sync` makes.
+    // Branch points — or a chain whose parent carries a commit its children
+    // never absorbed, so the parent's tip is not an ancestor of the chain tip
+    // and a single `--update-refs` pass would strand it (see
+    // [`rebase::chain_is_natively_restackable`]). Fall back to the state-backed
+    // engine with per-branch chains: each branch is rebased onto its parent using
+    // its own fork point, so every commit is carried and a conflict on one branch
+    // leaves earlier branches in the same chain restacked cleanly — the same
+    // trade-off `gt sync` makes.
     rebase::split_chains_per_branch(&graph, &mut plan);
     rebase::start_best_effort(&graph, plan, &selection.on_path)
 }

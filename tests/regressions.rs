@@ -2016,8 +2016,11 @@ fn restack_does_not_falsely_claim_a_stranded_ref_was_restacked() {
     // intermediate. gt must not announce "restacked dvs" when the ref did not
     // move — that is precisely how the desync stays silent. It reports the
     // stranded branch instead, leaves its ref untouched (never lost), and keeps
-    // flagging it.
+    // flagging it. The fork point here is corrupt (dvs never sat on docker), so
+    // gt must not divert this to the per-branch engine either: rebasing off a
+    // base the branch never sat on is degenerate and can mangle unrelated refs.
     let (repo, dvs_orig) = stranded_intermediate_stack("restack-strand-honest");
+    let main_orig = repo.git(&["rev-parse", "main"]);
     repo.git(&["switch", "-q", "feat"]);
 
     let out = repo.gt("restack", "");
@@ -2033,11 +2036,17 @@ fn restack_does_not_falsely_claim_a_stranded_ref_was_restacked() {
         "restack must report the stranded intermediate; got:\n{stdout}"
     );
 
-    // Golden rule: the stranded ref is left exactly where it was, not lost.
+    // Golden rule: the stranded ref is left exactly where it was, not lost — and
+    // the degenerate per-branch rebase never fires, so trunk is untouched.
     assert_eq!(
         repo.git(&["rev-parse", "dvs"]),
         dvs_orig,
         "the stranded ref must be left intact"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "main"]),
+        main_orig,
+        "restacking a corrupt fork point must never move trunk"
     );
 
     // And the desync is still surfaced afterward, not silently "healed".
@@ -2513,4 +2522,88 @@ fn submit_skips_push_for_branches_already_up_to_date() {
         1,
         "the unchanged branch must still skip; got stderr:\n{stderr}"
     );
+}
+
+#[test]
+fn restack_carries_a_parent_commit_children_never_absorbed_instead_of_stranding_it() {
+    // The reported loop: a commit is added to a parent branch (so its children
+    // no longer descend from its tip), and then trunk advances — so the parent
+    // *also* needs a restack and gets pulled into one linear chain with its
+    // children. A single `git rebase --update-refs` over the deepest branch
+    // walks a history that omits the parent's new commit: it drops the commit
+    // and strands the parent's ref. gt then (correctly) refuses to record a
+    // restack that never moved the ref, so `needs_restack` stays true and every
+    // `gt restack` repeats the same failed move — `gt submit` never passes. gt
+    // must detect the non-linear chain and rebase per-branch, carrying the
+    // parent's commit down onto its children cleanly.
+    let repo = TestRepo::new("restack-carries-unabsorbed-parent-commit");
+    repo.write("base.txt", "base\n");
+    repo.commit("c0 main");
+
+    // main <- dvs <- predeploy <- feat, all tracked the ordinary way.
+    repo.create_with_gt("land ValidatorSet", "dvs", "dvs.txt", "v1\n");
+    repo.create_with_gt("predeploy dvs", "predeploy", "pre.txt", "p1\n");
+    repo.create_with_gt("feat antithesis", "feat", "feat.txt", "f1\n");
+
+    // Add a commit to `predeploy` that its child `feat` was never stacked on:
+    // predeploy's tip now sits ahead of where feat forked, so it is no longer an
+    // ancestor of feat (the "review fixups" commit in the report).
+    repo.git(&["switch", "-q", "predeploy"]);
+    repo.write("fixups.txt", "review fixups\n");
+    repo.git(&["add", "fixups.txt"]);
+    repo.git(&["commit", "-q", "-m", "review fixups"]);
+    assert!(
+        !repo
+            .git_allow_fail(&["merge-base", "--is-ancestor", "predeploy", "feat"])
+            .status
+            .success(),
+        "guard: predeploy's tip must not be an ancestor of feat (the un-absorbed commit)"
+    );
+
+    // Advance trunk so the whole stack needs restacking — this pulls `predeploy`
+    // into a single linear chain [dvs, predeploy, feat] as an intermediate,
+    // exactly where the single-rebase path strands it.
+    repo.git(&["switch", "-q", "main"]);
+    repo.write("base.txt", "base\nnewer\n");
+    repo.commit("newer main");
+    repo.git(&["switch", "-q", "predeploy"]);
+
+    let out = repo.gt("restack", "");
+    assert_success(&out, "gt restack");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("stranded"),
+        "restack must not strand the parent's ref; got:\n{stdout}"
+    );
+
+    // Every branch actually descends from its parent now, and predeploy's
+    // un-absorbed commit was carried down onto feat rather than dropped.
+    for (child, parent) in [("dvs", "main"), ("predeploy", "dvs"), ("feat", "predeploy")] {
+        assert!(
+            repo.git_allow_fail(&["merge-base", "--is-ancestor", parent, child])
+                .status
+                .success(),
+            "{child} must descend from {parent} after restack; got:\n{stdout}"
+        );
+    }
+    assert_eq!(
+        repo.git(&["show", "feat:fixups.txt"]),
+        "review fixups",
+        "the parent's commit must be carried into the child line, not dropped"
+    );
+
+    // And nothing on the path is flagged anymore — the submit loop is broken.
+    let out = repo.gt("log", "");
+    assert_success(&out, "gt log after restack");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for b in ["dvs", "predeploy", "feat"] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(&format!(" {b} ")) || l.contains(&format!(" {b}\u{1b}")))
+            .unwrap_or_else(|| panic!("no {b} line in gt log:\n{stdout}"));
+        assert!(
+            !line.contains("needs restack"),
+            "{b} must not be flagged after restack; got:\n{stdout}"
+        );
+    }
 }
