@@ -196,6 +196,94 @@ pub fn split_chains_per_branch(graph: &StackGraph, plan: &mut RestackPlan) {
     plan.chains = out;
 }
 
+/// Whether [`restack_native`]'s single `git rebase --update-refs` over the
+/// deepest branch can restack this whole chain.
+///
+/// That one rebase only relocates an intermediate ref whose commit is on the
+/// deepest branch's line — either reachable from the tip (so `--update-refs`
+/// moves it) or patch-equivalent to a commit already on it (so
+/// [`relocate_stranded`] re-points it). It returns false only for the case that
+/// path cannot handle: an intermediate branch carrying a commit that is neither
+/// reachable from the chain tip nor patch-equivalent to anything on it — e.g. a
+/// commit added or amended on a parent after its children were stacked, while
+/// the parent itself also needs a restack because trunk moved. The single rebase
+/// walks only the tip's history, never replays that commit, and strands the
+/// parent's ref with no equivalent to relocate onto — so its fork point is left
+/// untouched, `gt submit` keeps reporting the stack out of date, and re-running
+/// `gt restack` repeats the same failed move. Such a chain must go through the
+/// per-branch engine ([`split_chains_per_branch`]), which rebases each branch
+/// onto its parent using its own recorded fork point and so carries every
+/// commit.
+///
+/// A grafted branch is reported restackable here so `restack_native`'s own
+/// up-front refusal ([`ensure_no_grafted_branches`]) still fires — diverting it
+/// would merely have the per-branch engine skip it, and ancestry across a graft
+/// boundary is unreliable anyway. So is a chain with a corrupt fork point (a
+/// branch that never sat on its recorded base): the per-branch engine's `--onto`
+/// rebase would be degenerate there and could mangle unrelated refs, so it is
+/// left to `restack_native`, which reports the strand honestly and moves nothing.
+pub fn chain_is_natively_restackable(graph: &StackGraph, chain: &Chain) -> Result<bool> {
+    // A grafted branch anywhere in the chain: leave the whole chain to
+    // restack_native's refusal, and don't trust the ancestry checks below —
+    // reachability across a shallow graft boundary is unreliable in both
+    // directions (a branch *below* the graft can look unreachable from the tip).
+    let shallow = git::shallow_boundaries()?;
+    if !shallow.is_empty() {
+        for b in &chain.branches {
+            if shallow.contains(&git::branch_tip(b)?) {
+                return Ok(true);
+            }
+        }
+    }
+
+    let tip = git::branch_tip(chain.tip())?;
+    // Every branch except the deepest (the tip itself) must be on the tip's line.
+    for b in &chain.branches[..chain.branches.len() - 1] {
+        let bt = git::branch_tip(b)?;
+        if git::is_ancestor(&bt, &tip)? {
+            continue; // `--update-refs` will move this ref
+        }
+        // Stranded off the tip's line. `restack_native` can still rescue it if
+        // an equivalent commit was already replayed onto that line; only a
+        // strand with no equivalent — a commit the descendants never absorbed —
+        // needs the per-branch engine, and only when the chain's fork points are
+        // consistent (otherwise per-branch would rebase off a base the branch
+        // never sat on; see [`chain_metadata_is_consistent`]).
+        let has_equivalent = match git::patch_id(&bt)? {
+            Some(pid) => git::patch_ids_in_range(&chain.old_base, chain.tip())?
+                .into_iter()
+                .any(|(p, sha)| p == pid && sha != bt),
+            None => false,
+        };
+        if !has_equivalent {
+            return Ok(!chain_metadata_is_consistent(graph, chain)?);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether every branch in the chain genuinely descends from its own recorded
+/// fork point — the precondition for the per-branch engine, which rebases each
+/// branch's own commits with `git rebase --onto <parent> <fork point> -- <b>`.
+/// A fork point the branch never sat on makes that range degenerate (it can
+/// sweep in and rewrite unrelated refs, even trunk), so such a chain must not be
+/// diverted to per-branch.
+fn chain_metadata_is_consistent(graph: &StackGraph, chain: &Chain) -> Result<bool> {
+    for b in &chain.branches {
+        let Some(rev) = graph
+            .get(b)
+            .and_then(|n| n.meta.as_ref())
+            .and_then(|m| m.parent_branch_revision.as_deref())
+        else {
+            return Ok(false);
+        };
+        if !git::is_ancestor(rev, &git::branch_tip(b)?)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Plan a restack of the subtrees rooted at `roots`.
 pub fn plan(graph: &StackGraph, roots: &[String], operation: &str) -> Result<RestackPlan> {
     plan_inner(graph, roots, operation, None)
