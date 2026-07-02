@@ -269,6 +269,37 @@ impl TestRepo {
     fn current_branch(&self) -> String {
         self.git(&["symbolic-ref", "--short", "HEAD"])
     }
+
+    /// Shadow the `git` on this repo's PATH with a shim that dirties `lock.txt`
+    /// the first time gt tries to `switch -- <return_branch>` while HEAD is on a
+    /// different branch — reproducing a background tool (rust-analyzer/cargo)
+    /// regenerating a tracked file between the last rebase and the return
+    /// switch. It fires exactly once (guarded by an `ARM_RETURN` sentinel), then
+    /// forwards every invocation to the real git.
+    fn arm_dirty_on_return_switch(&self, return_branch: &str) {
+        let real = real_git();
+        let real = real.display();
+        let bin = self.root.join("bin");
+        let shim = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = switch ] && [ \"$2\" = -- ] && [ \"$3\" = \"{return_branch}\" ] \
+             && [ -f ARM_RETURN ]; then\n\
+             \x20 if [ \"$(\"{real}\" symbolic-ref --short -q HEAD 2>/dev/null)\" != \
+             \"{return_branch}\" ]; then\n\
+             \x20   rm -f ARM_RETURN\n\
+             \x20   printf 'REGEN\\n' >> lock.txt\n\
+             \x20 fi\n\
+             fi\n\
+             exec \"{real}\" \"$@\"\n",
+        );
+        fs::write(bin.join("git"), shim).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(self.repo.join("ARM_RETURN"), "").unwrap();
+    }
 }
 
 impl Drop for TestRepo {
@@ -281,6 +312,16 @@ fn gt_bin() -> PathBuf {
     option_env!("CARGO_BIN_EXE_gt")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/gt"))
+}
+
+/// The real `git` on the test process's own PATH (which never includes a
+/// repo's shim bin), so a shim can forward to it.
+fn real_git() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|d| d.join("git"))
+        .find(|c| c.is_file())
+        .unwrap_or_else(|| PathBuf::from("git"))
 }
 
 fn assert_success(out: &Output, what: &str) {
@@ -2606,4 +2647,83 @@ fn restack_carries_a_parent_commit_children_never_absorbed_instead_of_stranding_
             "{b} must not be flagged after restack; got:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn sync_returns_to_start_branch_when_tree_is_dirtied_mid_operation() {
+    // Regression: a background tool (rust-analyzer/cargo) regenerated a tracked
+    // file between the last rebase and sync's return switch. The hard `git
+    // switch` back then failed ("local changes would be overwritten"), so sync
+    // aborted with an error and stranded the user on whatever branch the last
+    // rebase happened to leave them on. Sync must instead stash the stray
+    // change, return to the branch the user started on, and reapply it.
+    let repo = TestRepo::new("sync-return-dirtied");
+    repo.add_origin();
+    // A shared multi-line lock file: each branch changes only the header, so a
+    // tail append (the "regen") reapplies cleanly across the branch switch.
+    repo.write("lock.txt", "HEADER-main\nbody1\nbody2\n");
+    repo.write("base.txt", "base\n");
+    repo.commit("root commit");
+    repo.git(&["push", "-q", "origin", "main"]);
+
+    // main <- feat <- top, each giving lock.txt its own header. Stage every
+    // change (create_with_gt stages only the one named file, which would leave
+    // the lock.txt edit uncommitted) so lock.txt is committed on each branch.
+    repo.write("lock.txt", "HEADER-feat\nbody1\nbody2\n");
+    repo.write("f.txt", "f\n");
+    repo.git(&["add", "-A"]);
+    assert_success(&repo.gt("create", "feat feature\nfeat\n"), "gt create feat");
+    repo.write("lock.txt", "HEADER-top\nbody1\nbody2\n");
+    repo.write("t.txt", "t\n");
+    repo.git(&["add", "-A"]);
+    assert_success(&repo.gt("create", "top feature\ntop\n"), "gt create top");
+
+    // Advance trunk so both branches need a restack, then return to `feat` —
+    // the branch sync must bring us back to. `top` (stacked on `feat`) is
+    // restacked last, so gt ends on `top` before the return switch.
+    advance_origin_main(&repo, "upstream commit", "upstream.txt", "upstream\n");
+    repo.git(&["switch", "-q", "feat"]);
+
+    // Arm the shim: gt's final `switch -- feat` will find the tree dirtied.
+    repo.arm_dirty_on_return_switch("feat");
+
+    let out = repo.gt("sync", "");
+    assert_success(&out, "gt sync");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // 1. Back on the branch we started on — not stranded on `top`.
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--short", "HEAD"]),
+        "feat",
+        "sync must return to the start branch even when the tree was dirtied \
+         mid-operation; stdout:\n{stdout}"
+    );
+    // 2. Both branches were restacked onto the advanced trunk.
+    assert_eq!(
+        repo.git(&["merge-base", "feat", "main"]),
+        repo.git(&["rev-parse", "main"]),
+        "feat must be restacked onto the advanced trunk"
+    );
+    assert_eq!(
+        repo.git(&["merge-base", "top", "feat"]),
+        repo.git(&["rev-parse", "feat"]),
+        "top must be restacked onto feat"
+    );
+    // 3. The stray change was carried across and reapplied, not lost.
+    assert_eq!(
+        fs::read_to_string(repo.repo.join("lock.txt")).unwrap(),
+        "HEADER-feat\nbody1\nbody2\nREGEN\n",
+        "the mid-operation change must be reapplied on the start branch"
+    );
+    // 4. A clean reapply leaves nothing parked in a stash.
+    assert_eq!(
+        repo.git(&["stash", "list"]),
+        "",
+        "a clean reapply must not leave a dangling stash entry"
+    );
+    // 5. The user is told what happened.
+    assert!(
+        stdout.contains("lock.txt") && stdout.contains("reapplied"),
+        "sync must report the stash-and-reapply; got stdout:\n{stdout}"
+    );
 }

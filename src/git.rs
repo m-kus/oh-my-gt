@@ -210,12 +210,89 @@ pub fn remote_tracking_tip(remote: &str, branch: &str) -> Result<Option<String>>
     rev_parse_opt(&format!("refs/remotes/{remote}/{branch}"))
 }
 
-/// Switch to `branch` if it exists; otherwise do nothing.
-pub fn switch_if_exists(branch: &str) -> Result<()> {
-    if branch_exists(branch)? {
-        run(&["switch", "--", branch])?;
+/// Stash message used when parking changes to cross branches in
+/// [`switch_returning`]. Distinctive so a leftover entry is recognizable.
+const RETURN_STASH_MSG: &str = "gt: parked to return to your branch";
+
+/// Where [`switch_returning`] left the caller.
+pub enum ReturnOutcome {
+    /// Nothing to do: already on the target, or it no longer exists.
+    NoOp,
+    /// Switched with no uncommitted changes that needed carrying.
+    Clean,
+    /// Switched, and uncommitted changes were stashed across and reapplied
+    /// cleanly. Holds the affected file paths, for reporting.
+    Reapplied { files: Vec<String> },
+    /// Switched, but the stashed changes conflicted on the target and could not
+    /// be reapplied; they are safe in a stash (`git stash pop` to restore).
+    /// Holds the affected file paths.
+    Parked { files: Vec<String> },
+    /// Could not switch at all; still on `was`.
+    Stuck { was: String },
+}
+
+/// Return to `branch`, carrying any uncommitted changes across with you.
+///
+/// A plain `git switch` refuses when the working tree holds local changes that
+/// differ on the target — which strands the caller on the wrong branch when
+/// something modified the tree mid-operation (a background rust-analyzer /
+/// cargo run regenerating `Cargo.lock`, say, between the last rebase and this
+/// switch). This never strands: it stashes such changes, switches, and reapplies
+/// them; if the reapply conflicts, the changes stay safe in a stash rather than
+/// leaving conflict markers behind. The returned [`ReturnOutcome`] reports what
+/// happened. Genuine git failures still propagate.
+pub fn switch_returning(branch: &str) -> Result<ReturnOutcome> {
+    if !branch_exists(branch)? {
+        return Ok(ReturnOutcome::NoOp);
     }
-    Ok(())
+    if current_branch()?.as_deref() == Some(branch) {
+        return Ok(ReturnOutcome::NoOp);
+    }
+    // Fast path: a plain switch. Succeeds when the tree is clean, or when its
+    // changes don't collide with the target (git carries those across itself).
+    if run_allow_fail(&["switch", "--", branch])?.code == 0 {
+        return Ok(ReturnOutcome::Clean);
+    }
+    // The switch was refused. If nothing is dirty this is not the known "local
+    // changes would be overwritten" case, so surface it rather than paper over.
+    if !is_dirty()? {
+        return Ok(ReturnOutcome::Stuck {
+            was: current_branch()?.unwrap_or_default(),
+        });
+    }
+    let files = dirty_files()?;
+    // Park the changes so the switch can proceed, then bring them along.
+    if run_allow_fail(&["stash", "push", "--message", RETURN_STASH_MSG])?.code != 0 {
+        return Ok(ReturnOutcome::Stuck {
+            was: current_branch()?.unwrap_or_default(),
+        });
+    }
+    if run_allow_fail(&["switch", "--", branch])?.code != 0 {
+        // Couldn't switch even with a clean tree; put the changes back where we
+        // are so they aren't left silently parked, and report being stuck.
+        let _ = run_allow_fail(&["stash", "pop"]);
+        return Ok(ReturnOutcome::Stuck {
+            was: current_branch()?.unwrap_or_default(),
+        });
+    }
+    // On the target branch now with a clean tree. Reapply the parked changes.
+    if run_allow_fail(&["stash", "pop"])?.code == 0 {
+        return Ok(ReturnOutcome::Reapplied { files });
+    }
+    // The reapply conflicted. `git stash pop` keeps the entry when it cannot
+    // apply cleanly, so the changes are still recoverable; clear the
+    // half-applied merge from the tree (the content is safe in the stash) and
+    // let the caller tell the user to restore it by hand.
+    let _ = run_allow_fail(&["reset", "--hard", "HEAD"]);
+    Ok(ReturnOutcome::Parked { files })
+}
+
+/// Paths of tracked files with staged or unstaged modifications.
+fn dirty_files() -> Result<Vec<String>> {
+    Ok(run(&["status", "--porcelain", "--untracked-files=no"])?
+        .lines()
+        .filter_map(|l| l.get(3..).map(str::to_string))
+        .collect())
 }
 
 /// `git merge-base <a> <b>`.
