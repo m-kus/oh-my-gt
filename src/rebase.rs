@@ -682,7 +682,7 @@ pub fn restack_native(chain: Chain, current: &str) -> Result<()> {
         return Err(GtError::Paused);
     }
     write_chain_metadata(&chain)?;
-    git::switch_if_exists(current)?;
+    return_to(current, &OutputStyle::stdout())?;
     Ok(())
 }
 
@@ -809,6 +809,37 @@ fn print_conflict_pause(branch: Option<&str>) {
     println!("or run `gt abort` to undo the rebase");
 }
 
+/// Return to the branch an operation started on, carrying any changes that were
+/// made to the working tree mid-operation, and report what it took to get there.
+/// See [`git::switch_returning`] for why a plain switch is not enough.
+fn return_to(branch: &str, style: &OutputStyle) -> Result<()> {
+    match git::switch_returning(branch)? {
+        git::ReturnOutcome::NoOp | git::ReturnOutcome::Clean => {}
+        git::ReturnOutcome::Reapplied { files } => println!(
+            "{} the working tree was modified during the operation ({}); stashed it, \
+             returned to {}, and reapplied it",
+            style.warning("note:"),
+            files.join(", "),
+            style.branch(branch)
+        ),
+        git::ReturnOutcome::Parked { files } => println!(
+            "{} returned to {}, but your changes to {} could not be reapplied (they \
+             conflicted) — they are safe in a stash; run `git stash pop` to restore them",
+            style.warning("note:"),
+            style.branch(branch),
+            files.join(", ")
+        ),
+        git::ReturnOutcome::Stuck { was } => println!(
+            "{} could not return to {}; you are on {}. Commit or stash your changes, \
+             then run `git switch {branch}`",
+            style.warning("note:"),
+            style.branch(branch),
+            style.branch(&was)
+        ),
+    }
+    Ok(())
+}
+
 // ── internals ───────────────────────────────────────────────────────────────
 
 /// Best-effort variant of [`drive`], used by `gt sync` and `gt restack`.
@@ -926,7 +957,7 @@ fn drive_best_effort(mut st: OpState) -> Result<()> {
 
     state::clear()?;
     if let Some(rb) = &st.return_branch {
-        git::switch_if_exists(rb)?;
+        return_to(rb, &style)?;
     }
     Ok(())
 }
@@ -1211,7 +1242,7 @@ fn handle_rebase_exit(st: &mut OpState, git_dir: &Path, detail: &str) -> Result<
 fn complete(st: OpState) -> Result<()> {
     state::clear()?;
     if let Some(rb) = &st.return_branch {
-        git::switch_if_exists(rb)?;
+        return_to(rb, &OutputStyle::stdout())?;
     }
     Ok(())
 }
