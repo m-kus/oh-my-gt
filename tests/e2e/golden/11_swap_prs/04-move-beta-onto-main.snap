@@ -12,5 +12,5 @@ commits:
 @beta-feature-1123c8 tree=1123c87a6f1615b1f52143836e452a46914f9994 parents=[@root-commit] beta feature
 @root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
 metadata:
-  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit","prInfo":{"number":1,"base":"main","url":"https://example.test/pr/1","title":"alpha feature","state":"OPEN"}}
-  beta: {"parentBranchName":"main","parentBranchRevision":"@root-commit","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"beta feature","state":"OPEN"}}
+  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit","prInfo":{"number":1,"base":"main","url":"https://example.test/pr/1","title":"[1/2] alpha feature","state":"OPEN"}}
+  beta: {"parentBranchName":"main","parentBranchRevision":"@root-commit","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"[2/2] beta feature","state":"OPEN"}}

@@ -12,4 +12,4 @@ commits:
 @merge-alpha tree=e7a6795824337bf7b6300a422b9b33ba4a97e8a3 parents=[@root-commit @alpha-feature] merge alpha
 @root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
 metadata:
-  beta: {"parentBranchName":"main","parentBranchRevision":"@merge-alpha","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"beta feature","state":"OPEN"}}
+  beta: {"parentBranchName":"main","parentBranchRevision":"@merge-alpha","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"[2/2] beta feature","state":"OPEN"}}

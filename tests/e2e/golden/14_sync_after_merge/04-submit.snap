@@ -13,6 +13,6 @@ commits:
 @gamma-feature tree=3b3b3ed7990c0dc5bf69d9b048dbaa3d863d56db parents=[@beta-feature] gamma feature
 @root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
 metadata:
-  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit","prInfo":{"number":1,"base":"main","url":"https://example.test/pr/1","title":"alpha feature","state":"OPEN"}}
-  beta: {"parentBranchName":"alpha","parentBranchRevision":"@alpha-feature","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"beta feature","state":"OPEN"}}
-  gamma: {"parentBranchName":"beta","parentBranchRevision":"@beta-feature","prInfo":{"number":3,"base":"beta","url":"https://example.test/pr/3","title":"gamma feature","state":"OPEN"}}
+  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit","prInfo":{"number":1,"base":"main","url":"https://example.test/pr/1","title":"[1/3] alpha feature","state":"OPEN"}}
+  beta: {"parentBranchName":"alpha","parentBranchRevision":"@alpha-feature","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"[2/3] beta feature","state":"OPEN"}}
+  gamma: {"parentBranchName":"beta","parentBranchRevision":"@beta-feature","prInfo":{"number":3,"base":"beta","url":"https://example.test/pr/3","title":"[3/3] gamma feature","state":"OPEN"}}

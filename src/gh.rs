@@ -99,3 +99,11 @@ pub fn set_body(number: u64, body: &str) -> Result<()> {
         "pr edit",
     )
 }
+
+/// Replace the title of an existing pull request.
+pub fn set_title(number: u64, title: &str) -> Result<()> {
+    checked(
+        &["pr", "edit", &number.to_string(), "--title", title],
+        "pr edit",
+    )
+}

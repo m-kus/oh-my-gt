@@ -183,7 +183,25 @@ pub fn run() -> Result<()> {
         eprintln!("updating stack overview in each PR description");
     }
 
-    for (branch, pr, was_existing) in &prs {
+    let total = prs.len();
+    for (i, (branch, pr, was_existing)) in prs.iter().enumerate() {
+        // Prefix the title with the PR's 1-based position in the stack, using
+        // the same bottom-to-top numbering as the first-pass progress line.
+        // Suppressed for single-branch stacks, matching the stack overview.
+        let pos = if total > 1 {
+            Some((i + 1, total))
+        } else {
+            None
+        };
+        let new_title = compose_title(&pr.title, pos);
+        if new_title != pr.title {
+            step(
+                &style,
+                &format!("updating title of PR #{}", pr.number),
+                || gh::set_title(pr.number, &new_title),
+            )?;
+        }
+
         let new_body = compose_body(&pr.body, section.as_deref(), &pr.url);
         if new_body != pr.body {
             step(
@@ -198,7 +216,7 @@ pub fn run() -> Result<()> {
             number: Some(pr.number),
             base: Some(pr.base.clone()),
             url: Some(pr.url.clone()),
-            title: Some(pr.title.clone()),
+            title: Some(new_title.clone()),
             // The body is computed fresh on every submit from the live PR and
             // the current graph, so there is no need to snapshot it here.
             body: None,
@@ -225,6 +243,40 @@ fn split_subject_body(full: &str) -> (String, String) {
     match full.split_once('\n') {
         Some((subject, rest)) => (subject.trim().to_string(), rest.trim().to_string()),
         None => (full.trim().to_string(), String::new()),
+    }
+}
+
+/// Strip a leading `[x/n] ` stack-position marker that a previous submit may
+/// have prepended, so re-rendering a title is idempotent and prefixes never
+/// accumulate. Only the exact `[<digits>/<digits>]` shape (with an optional
+/// single trailing space) is removed — user brackets like `[WIP]` are left
+/// untouched.
+fn strip_index_prefix(title: &str) -> &str {
+    let Some(rest) = title.strip_prefix('[') else {
+        return title;
+    };
+    let Some((num, after_slash)) = rest.split_once('/') else {
+        return title;
+    };
+    let Some((den, tail)) = after_slash.split_once(']') else {
+        return title;
+    };
+    let is_number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !is_number(num) || !is_number(den) {
+        return title;
+    }
+    tail.strip_prefix(' ').unwrap_or(tail)
+}
+
+/// Build the final PR title. When `pos` is `Some((n, total))` the title is
+/// prefixed with a fresh `[n/total] ` stack-position marker; when `None`
+/// (single-branch stacks) any prior marker is stripped and none re-added.
+/// Idempotent: an already-marked title re-renders to itself.
+fn compose_title(existing: &str, pos: Option<(usize, usize)>) -> String {
+    let base = strip_index_prefix(existing);
+    match pos {
+        None => base.to_string(),
+        Some((n, total)) => format!("[{n}/{total}] {base}"),
     }
 }
 
@@ -334,8 +386,8 @@ fn append_stack_section(body: &str, section: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_stack_section, compose_body, mark_current, render_stack_overview,
-        split_subject_body, strip_stack_section, STACK_END, STACK_START,
+        append_stack_section, compose_body, compose_title, mark_current, render_stack_overview,
+        split_subject_body, strip_index_prefix, strip_stack_section, STACK_END, STACK_START,
     };
 
     #[test]
@@ -383,6 +435,53 @@ mod tests {
         let (title, body) = split_subject_body("Subject line\nBody on the next line.\n");
         assert_eq!(title, "Subject line");
         assert_eq!(body, "Body on the next line.");
+    }
+
+    #[test]
+    fn compose_title_prepends_position_for_multi_branch_stacks() {
+        // A multi-branch stack tags each title with its 1-based position.
+        assert_eq!(
+            compose_title("Add login flow", Some((2, 3))),
+            "[2/3] Add login flow"
+        );
+    }
+
+    #[test]
+    fn compose_title_is_idempotent_and_reflows_on_move() {
+        // Re-rendering an already-marked title must not stack prefixes, and a
+        // PR that moves position (or grows/shrinks the stack) gets a corrected
+        // marker rather than an accumulated one.
+        let once = compose_title("Add login flow", Some((1, 2)));
+        assert_eq!(once, "[1/2] Add login flow");
+        assert_eq!(compose_title(&once, Some((1, 2))), once);
+        assert_eq!(compose_title(&once, Some((2, 4))), "[2/4] Add login flow");
+    }
+
+    #[test]
+    fn compose_title_none_strips_stale_marker() {
+        // When the stack shrinks to a single branch the marker is dropped, and
+        // an unmarked title is returned unchanged.
+        assert_eq!(
+            compose_title("[1/2] Add login flow", None),
+            "Add login flow"
+        );
+        assert_eq!(compose_title("Add login flow", None), "Add login flow");
+    }
+
+    #[test]
+    fn strip_index_prefix_leaves_user_brackets_alone() {
+        // Only our own `[digits/digits]` shape is stripped; anything else the
+        // user wrote at the front of the title survives untouched.
+        assert_eq!(
+            strip_index_prefix("[WIP] Add login flow"),
+            "[WIP] Add login flow"
+        );
+        assert_eq!(strip_index_prefix("[10/12] Ship it"), "Ship it");
+        assert_eq!(strip_index_prefix("[1/x] nope"), "[1/x] nope");
+        assert_eq!(strip_index_prefix("[/2] nope"), "[/2] nope");
+        assert_eq!(strip_index_prefix("no marker here"), "no marker here");
+        // Missing trailing space is tolerated so a hand-edited title still cleans up.
+        assert_eq!(strip_index_prefix("[3/5]tight"), "tight");
     }
 
     #[test]

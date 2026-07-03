@@ -18,5 +18,5 @@ commits:
 @beta-third-0d550e tree=0d550e8783a9b33204f2b297e81d3fcd163f5ae9 parents=[@beta-second-90a7d7] beta third
 @root-commit tree=a07f2b069c073411c0eacc119c56b5643617bda0 parents=[] root commit
 metadata:
-  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit","prInfo":{"number":1,"base":"main","url":"https://example.test/pr/1","title":"alpha second","state":"OPEN"}}
-  beta: {"parentBranchName":"alpha","parentBranchRevision":"@alpha-second-a3ab55","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"beta third","state":"OPEN"}}
+  alpha: {"parentBranchName":"main","parentBranchRevision":"@root-commit","prInfo":{"number":1,"base":"main","url":"https://example.test/pr/1","title":"[1/2] alpha second","state":"OPEN"}}
+  beta: {"parentBranchName":"alpha","parentBranchRevision":"@alpha-second-a3ab55","prInfo":{"number":2,"base":"alpha","url":"https://example.test/pr/2","title":"[2/2] beta third","state":"OPEN"}}
